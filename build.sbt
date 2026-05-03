@@ -1,4 +1,4 @@
 organization := "edu.unimelb.ee"
 version := "1.0"
 name := "conv-accelerator"
-scalaVersion := "2.12.10"
+scalaVersion := "2.13.16"

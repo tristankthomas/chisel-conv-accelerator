@@ -11,18 +11,32 @@ Matrix convolution accelerator for CNN, implemented in Chisel and integrated int
 
 1. Follow [Chipyard installation instructions](https://chipyard.readthedocs.io)
 2. Clone this repo into `chipyard/generators/conv-accelerator`
-3. Add the following to `chipyard/build.sbt`:
+3. Add the following to `chipyard/build.sbt` after the gemmini lazy val (~line 367):
 
 ```scala
 lazy val convAccelerator = (project in file("generators/conv-accelerator"))
-  .dependsOn(testchipip, rocketchip)
+  .dependsOn(rocketchip)
   .settings(libraryDependencies ++= rocketLibDeps.value)
-  .settings(chiselTestSettings)
   .settings(commonSettings)
 ```
 
-4. Add `convAccelerator` to the chipyard project `dependsOn` list
-5. `source ~/chipyard/env.sh`
+4. Add to the `optionalModules` list in the chipyard lazy val:
+
+```scala
+"conv-accelerator" -> convAccelerator,
+```
+
+5. Add to `chipyard/generators/chipyard/src/main/scala/config/TutorialConfigs.scala`:
+
+```scala
+import convaccelerator._
+
+class MACConfig extends Config(
+  new WithMAC ++
+  new RocketConfig)
+```
+
+6. `source ~/chipyard/env.sh`
 
 ## Structure
 
