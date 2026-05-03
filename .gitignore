@@ -1,0 +1,5 @@
+*.riscv
+*.dump
+build/
+target/
+project/target/
