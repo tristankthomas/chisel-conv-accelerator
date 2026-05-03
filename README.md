@@ -36,7 +36,40 @@ class MACConfig extends Config(
   new RocketConfig)
 ```
 
-6. `source ~/chipyard/env.sh`
+6. Add the following to `chipyard/tests/CMakeLists.txt` in the Build section:
+
+```cmake
+set(CONV_ACC_TESTS /home/trist/chipyard/generators/conv-accelerator/src/test/c)
+include_directories(${CMAKE_SOURCE_DIR})
+include_directories(${CMAKE_SOURCE_DIR}/../toolchains/riscv-tools/riscv-tests/env)
+
+add_executable(matmul ${CONV_ACC_TESTS}/matmul.c)
+add_executable(mac_test ${CONV_ACC_TESTS}/MAC_test.c)
+```
+
+And in the Disassembly section:
+
+```cmake
+add_dump_target(matmul)
+add_dump_target(mac_test)
+```
+
+7. `source ~/chipyard/env.sh`
+
+## Running Tests
+
+```bash
+cd ~/chipyard/tests/build
+cmake ..
+make matmul
+make mac_test
+```
+
+```bash
+cd ~/chipyard/sims/verilator
+make CONFIG=RocketConfig run-binary BINARY=~/chipyard/tests/build/matmul.riscv
+make CONFIG=MACConfig run-binary BINARY=~/chipyard/tests/build/mac_test.riscv
+```
 
 ## Structure
 

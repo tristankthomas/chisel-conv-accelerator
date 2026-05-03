@@ -1,0 +1,7 @@
+[UART] UART0 is here (stdin/stdout).
+Result: 19
+Result C[0][1]: 22
+Result C[1][0]: 43
+Result C[1][1]: 50
+My matrix multiplication execution took 119 cycles
+- /home/trist/chipyard/sims/verilator/generated-src/chipyard.harness.TestHarness.RocketConfig/gen-collateral/TestDriver.v:158: Verilog $finish
