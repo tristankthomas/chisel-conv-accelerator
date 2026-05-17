@@ -5,9 +5,9 @@ import chisel3.util._
 
 class Convolution extends Module {
   val io = IO(new Bundle {
-    val window  = Input(Vec(25, UInt(16.W)))
-    val kernel  = Input(Vec(25, UInt(16.W)))
-    val result  = Output(UInt(32.W))
+    val window = Input(Vec(25, UInt(16.W)))
+    val kernel = Input(Vec(25, UInt(16.W)))
+    val result = Output(UInt(40.W))
   })
 
   // generate mul for each element

@@ -16,12 +16,12 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     with HasCoreParameters {
 
   // funct7 encodings
-  val FUNC_SET_ADDRS = 0.U
+  val FUNC_SET_INPUT = 0.U
   val FUNC_START = 1.U
   val FUNC_POLL_STATUS = 2.U
 
   // FSM states
-  val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE :: sSTORE :: sDONE :: Nil = Enum(6)
+  val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE :: sSTORE :: sWAIT_LAST_STORE :: sDONE :: Nil = Enum(7)
   val state = RegInit(sIDLE)
 
   // queue incoming commands
@@ -29,7 +29,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   // decode instruction
   val funct7 = cmd.bits.inst.funct
-  val doSetAddrs = funct7 === FUNC_SET_ADDRS
+  val doSetInput = funct7 === FUNC_SET_INPUT
   val doStart = funct7 === FUNC_START
   val doPoll = funct7 === FUNC_POLL_STATUS
   val doResp = cmd.bits.inst.xd
@@ -53,28 +53,37 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val outRow = RegInit(0.U(5.W))
   val outCol = RegInit(0.U(5.W))
 
+  val loadIdx = RegInit(0.U(11.W))
+  val storeIdx = RegInit(0.U(11.W))
+
   // padding offset
   val pad = kernelSize >> 1
-
-  // valid kernel check
-  val validKernel = (kernelSize === 1.U) || (kernelSize === 3.U) || (kernelSize === 5.U)
 
   // convolution engine
   val conv = Module(new Convolution())
   conv.io.kernel := kernelBuffer
 
-  // handle SET_ADDRS
-  when(cmd.fire && doSetAddrs) {
+  // handle SET_INPUT
+  when(cmd.fire && doSetInput) {
     inputAddr := cmd.bits.rs1
-    kernelAddr := cmd.bits.rs2
+    outputAddr := cmd.bits.rs2
   }
 
   // handle START
   when(cmd.fire && doStart) {
-    outputAddr := cmd.bits.rs1
+    
+    kernelAddr := cmd.bits.rs1
     kernelSize := cmd.bits.rs2
     done := false.B
     error := false.B
+    loadIdx := 0.U
+    storeIdx := 0.U
+    storeRespCount := 0.U
+    outRow := 0.U
+    outCol := 0.U
+    reqPending := false.B
+
+    val validKernel = (cmd.bits.rs2 === 1.U) || (cmd.bits.rs2 === 3.U) || (cmd.bits.rs2 === 5.U)
     when(validKernel) {
       state := sLOAD_INPUT
     } .otherwise {
@@ -85,7 +94,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   }
 
 
-  // combinational window construction - always active
+  // combinational window construction - generates 25 assigns
   for (ki <- 0 until 5) {
     for (kj <- 0 until 5) {
       val ii = outRow +& ki.U - pad
@@ -94,22 +103,74 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       conv.io.window(ki * 5 + kj) := Mux(inBounds, inputBuffer(ii)(jj), 0.U(16.W))
     }
   }
+
+
+  io.mem.req.valid := false.B
+  io.mem.req.bits := DontCare
+  io.mem.req.bits.phys := true.B
+
+  io.mem.s1_kill := false.B
+  io.mem.s2_kill := false.B
+
+  val reqPending = RegInit(false.B)
+  val storeRespCount = RegInit(0.U(11.W))
   
-  // FSM
+  // naive FSM
   switch(state) {
     is(sIDLE) { }
 
+    // load entire input matrix
     is(sLOAD_INPUT) {
+      when(!reqPending) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := inputAddr + (loadIdx << 1)
+        io.mem.req.bits.cmd := 0.U
+        io.mem.req.bits.size := 1.U
+        io.mem.req.bits.tag := 0.U
+        when(io.mem.req.ready) {
+          reqPending := true.B
+        }
+      }
+      when(io.mem.resp.valid && reqPending) {
+        reqPending := false.B
+        inputBuffer(loadIdx >> 5)(loadIdx & 31.U) := io.mem.resp.bits.data(15, 0)
+        when(loadIdx === 1023.U) {
+          loadIdx := 0.U
+          state := sLOAD_KERNEL
+        } .otherwise {
+          loadIdx := loadIdx + 1.U
+        }
+      }
     }
 
+    // load entire kernel
     is(sLOAD_KERNEL) {
+      val kernelLen = (kernelSize * kernelSize)(5, 0)
+      when(!reqPending) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := kernelAddr + (loadIdx << 1)
+        io.mem.req.bits.cmd := 0.U
+        io.mem.req.bits.size := 1.U
+        io.mem.req.bits.tag := 0.U
+        when(io.mem.req.ready) {
+          reqPending := true.B
+        }
+      }
+      when(io.mem.resp.valid && reqPending) {
+        reqPending := false.B
+        kernelBuffer(loadIdx) := io.mem.resp.bits.data(15, 0)
+        when(loadIdx === kernelLen - 1.U) {
+          loadIdx := 0.U
+          state := sCOMPUTE
+        } .otherwise {
+          loadIdx := loadIdx + 1.U
+        }
+      }
     }
 
+    // compute one element per cycle
     is(sCOMPUTE) {
-      // store result
       outputBuffer(outRow)(outCol) := conv.io.result >> 8
-
-      // iterate through all elements
       when(outCol === 31.U) {
         outCol := 0.U
         when(outRow === 31.U) {
@@ -122,10 +183,42 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         outCol := outCol + 1.U
       }
     }
-
+    
+    // store entire output matrix in memory
     is(sSTORE) {
+      io.mem.req.valid := true.B
+      // store in groups of 4 bytes (32 bits)
+      io.mem.req.bits.addr := outputAddr + (storeIdx << 2)
+      io.mem.req.bits.cmd := 1.U
+      io.mem.req.bits.size := 2.U
+      io.mem.req.bits.tag := 0.U
+      io.mem.req.bits.data := outputBuffer(storeIdx >> 5)(storeIdx & 31.U)
+      when(io.mem.req.ready) {
+        when(storeIdx === 1023.U) {
+          storeIdx := 0.U
+          state := sWAIT_LAST_STORE
+        } .otherwise {
+          storeIdx := storeIdx + 1.U
+        }
+      }
+      // count store responses as they arrive
+      when(io.mem.resp.valid) {
+        storeRespCount := storeRespCount + 1.U
+      }
     }
 
+    // wait until all 1024 store acks received before signalling complete
+    is(sWAIT_LAST_STORE) {
+      when(io.mem.resp.valid) {
+        storeRespCount := storeRespCount + 1.U
+      }
+      when(storeRespCount === 1024.U) {
+        storeRespCount := 0.U
+        state := sDONE
+      }
+    }
+
+    // convolution complete
     is(sDONE) {
       done := true.B
       state := sIDLE
@@ -147,8 +240,6 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   io.busy := state =/= sIDLE
   io.interrupt := false.B
 
-  io.mem.req.valid := false.B
-  io.mem.req.bits := DontCare
 }
 
 
