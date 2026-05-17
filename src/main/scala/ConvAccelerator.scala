@@ -56,6 +56,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val loadIdx = RegInit(0.U(11.W))
   val storeIdx = RegInit(0.U(11.W))
 
+  val reqPending = RegInit(false.B)
+  val storeRespCount = RegInit(0.U(11.W))
+
   // padding offset
   val pad = kernelSize >> 1
 
@@ -71,7 +74,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   // handle START
   when(cmd.fire && doStart) {
-    
+
     kernelAddr := cmd.bits.rs1
     kernelSize := cmd.bits.rs2
     done := false.B
@@ -112,8 +115,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   io.mem.s1_kill := false.B
   io.mem.s2_kill := false.B
 
-  val reqPending = RegInit(false.B)
-  val storeRespCount = RegInit(0.U(11.W))
+
   
   // naive FSM
   switch(state) {

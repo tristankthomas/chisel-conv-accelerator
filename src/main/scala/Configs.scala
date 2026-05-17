@@ -13,3 +13,13 @@ class WithMAC extends Config((site, here, up) => {
     }
   )
 })
+
+
+class WithConvAccelerator extends Config((site, here, up) => {
+  case BuildRoCC => up(BuildRoCC) ++ Seq(
+    (p: Parameters) => {
+      val acc = LazyModule.apply(new ConvAccelerator(OpcodeSet.custom0)(p))
+      acc
+    }
+  )
+})
