@@ -44,6 +44,10 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val done = RegInit(false.B)
   val error = RegInit(false.B)
 
+  // latch CPU privilege status for memory requests
+  val mem_dprv = RegInit(0.U(2.W))
+  val mem_dv = RegInit(false.B)
+
   // internal buffers
   val inputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(16.W))))))
   val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(16.W))))
@@ -74,7 +78,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   // handle START
   when(cmd.fire && doStart) {
-
+    printf("START received: kernelAddr=%x kernelSize=%d\n", cmd.bits.rs1, cmd.bits.rs2)
     kernelAddr := cmd.bits.rs1
     kernelSize := cmd.bits.rs2
     done := false.B
@@ -85,6 +89,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     outRow := 0.U
     outCol := 0.U
     reqPending := false.B
+    mem_dprv := cmd.bits.status.dprv
+    mem_dv := cmd.bits.status.dv
 
     val validKernel = (cmd.bits.rs2 === 1.U) || (cmd.bits.rs2 === 3.U) || (cmd.bits.rs2 === 5.U)
     when(validKernel) {
@@ -96,7 +102,6 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     }
   }
 
-
   // combinational window construction - generates 25 assigns
   for (ki <- 0 until 5) {
     for (kj <- 0 until 5) {
@@ -107,16 +112,22 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     }
   }
 
-
+  // default memory signals
   io.mem.req.valid := false.B
   io.mem.req.bits := DontCare
-  io.mem.req.bits.phys := true.B
-
+  io.mem.req.bits.phys := false.B
+  io.mem.req.bits.dprv := mem_dprv
+  io.mem.req.bits.dv := mem_dv
+  io.mem.req.bits.signed := false.B
+  io.mem.req.bits.no_resp := false.B
   io.mem.s1_kill := false.B
   io.mem.s2_kill := false.B
 
+  // debug
+  when(io.mem.req.valid && io.mem.req.ready) {
+    printf("MEM REQ: state=%d addr=%x loadIdx=%d\n", state, io.mem.req.bits.addr, loadIdx)
+  }
 
-  
   // naive FSM
   switch(state) {
     is(sIDLE) { }
@@ -126,7 +137,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       when(!reqPending) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := inputAddr + (loadIdx << 1)
-        io.mem.req.bits.cmd := 0.U
+        io.mem.req.bits.cmd := M_XRD
         io.mem.req.bits.size := 1.U
         io.mem.req.bits.tag := 0.U
         when(io.mem.req.ready) {
@@ -151,7 +162,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       when(!reqPending) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := kernelAddr + (loadIdx << 1)
-        io.mem.req.bits.cmd := 0.U
+        io.mem.req.bits.cmd := M_XRD
         io.mem.req.bits.size := 1.U
         io.mem.req.bits.tag := 0.U
         when(io.mem.req.ready) {
@@ -185,27 +196,29 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         outCol := outCol + 1.U
       }
     }
-    
-    // store entire output matrix in memory
+
+    // store one element at a time, waiting for response
     is(sSTORE) {
-      io.mem.req.valid := true.B
-      // store in groups of 4 bytes (32 bits)
-      io.mem.req.bits.addr := outputAddr + (storeIdx << 2)
-      io.mem.req.bits.cmd := 1.U
-      io.mem.req.bits.size := 2.U
-      io.mem.req.bits.tag := 0.U
-      io.mem.req.bits.data := outputBuffer(storeIdx >> 5)(storeIdx & 31.U)
-      when(io.mem.req.ready) {
+      when(!reqPending) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := outputAddr + (storeIdx << 2)
+        io.mem.req.bits.cmd := M_XWR
+        io.mem.req.bits.size := 2.U
+        io.mem.req.bits.tag := 0.U
+        io.mem.req.bits.data := outputBuffer(storeIdx >> 5)(storeIdx & 31.U)
+        when(io.mem.req.ready) {
+          reqPending := true.B
+        }
+      }
+      
+      when(io.mem.resp.valid && reqPending) {
+        reqPending := false.B
         when(storeIdx === 1023.U) {
           storeIdx := 0.U
-          state := sWAIT_LAST_STORE
+          state := sDONE
         } .otherwise {
           storeIdx := storeIdx + 1.U
         }
-      }
-      // count store responses as they arrive
-      when(io.mem.resp.valid) {
-        storeRespCount := storeRespCount + 1.U
       }
     }
 
@@ -247,7 +260,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
 // function convolve(input[32][32], kernel[K][K], output[32][32]):
 //     pad = K / 2
-    
+
 //     for i = 0 to 31:
 //         for j = 0 to 31:
 //             window = extract_window(input, i, j, pad)

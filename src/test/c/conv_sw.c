@@ -50,6 +50,9 @@ int main() {
     end = rdcycle();
 
     printf("output[0][0] = %u\n", output[0][0]);
+    printf("output[0][1] = %u\n", output[0][1]);
+    printf("output[1][0] = %u\n", output[1][0]);
+    printf("output[1][1] = %u\n", output[1][1]);
     printf("output[16][16] = %u\n", output[16][16]);
     printf("Software convolution took %lu cycles\n", end - start);
 
