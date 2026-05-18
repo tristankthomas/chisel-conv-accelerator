@@ -46,10 +46,6 @@ int main() {
         for (int j = 0; j < K; j++)
             kernel[i][j] = 28;
 
-    printf("input addr: %lx\n", (unsigned long)input);
-    printf("output addr: %lx\n", (unsigned long)output);
-    printf("kernel addr: %lx\n", (unsigned long)kernel);
-
     start = rdcycle();
 
     conv_set_input(input, output);
@@ -67,11 +63,12 @@ int main() {
         return 1;
     }
 
-    printf("output[0][0] = %u\n", output[0][0]);
-    printf("output[0][1] = %u\n", output[0][1]);
-    printf("output[1][0] = %u\n", output[1][0]);
-    printf("output[1][1] = %u\n", output[1][1]);
-    printf("output[16][16] = %u\n", output[16][16]);
+    printf("corners:  [0][0]=%u [0][31]=%u [31][0]=%u [31][31]=%u\n", 
+        output[0][0], output[0][31], output[31][0], output[31][31]);
+    printf("edges:    [0][1]=%u [1][0]=%u [0][16]=%u [16][0]=%u\n",
+        output[0][1], output[1][0], output[0][16], output[16][0]);
+    printf("centre:   [16][16]=%u [15][15]=%u\n",
+        output[16][16], output[15][15]);
     printf("Hardware convolution took %lu cycles\n", end - start);
 
     return 0;

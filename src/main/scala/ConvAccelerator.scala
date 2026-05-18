@@ -48,6 +48,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val mem_dprv = RegInit(0.U(2.W))
   val mem_dv = RegInit(false.B)
 
+  val kLoadRow = RegInit(0.U(3.W))
+  val kLoadCol = RegInit(0.U(3.W))
+
   // internal buffers
   val inputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(16.W))))))
   val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(16.W))))
@@ -78,7 +81,6 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   // handle START
   when(cmd.fire && doStart) {
-    printf("START received: kernelAddr=%x kernelSize=%d\n", cmd.bits.rs1, cmd.bits.rs2)
     kernelAddr := cmd.bits.rs1
     kernelSize := cmd.bits.rs2
     done := false.B
@@ -89,6 +91,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     outRow := 0.U
     outCol := 0.U
     reqPending := false.B
+    kLoadRow := 0.U
+    kLoadCol := 0.U
     mem_dprv := cmd.bits.status.dprv
     mem_dv := cmd.bits.status.dv
 
@@ -123,10 +127,40 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   io.mem.s1_kill := false.B
   io.mem.s2_kill := false.B
 
-  // debug
-  when(io.mem.req.valid && io.mem.req.ready) {
-    printf("MEM REQ: state=%d addr=%x loadIdx=%d\n", state, io.mem.req.bits.addr, loadIdx)
-  }
+
+
+    // debug
+  // when(io.mem.req.valid && io.mem.req.ready) {
+  //   printf("MEM REQ: state=%d addr=%x loadIdx=%d\n", state, io.mem.req.bits.addr, loadIdx)
+  // }
+
+  // // print when START fires
+  // when(cmd.fire && doStart) {
+  //   printf("START: kernelSize=%d pad=%d\n", cmd.bits.rs2, cmd.bits.rs2 >> 1)
+  // }
+
+  // // print state transitions
+  // when(state === sLOAD_INPUT && io.mem.resp.valid && reqPending && loadIdx === 1023.U) {
+  //   printf("LOAD_INPUT done, transitioning to LOAD_KERNEL\n")
+  // }
+  // when(state === sLOAD_KERNEL && io.mem.resp.valid && reqPending) {
+  //   printf("KERNEL[%d] = %x\n", loadIdx, io.mem.resp.bits.data(15, 0))
+  // }
+  // when(state === sLOAD_KERNEL && io.mem.resp.valid && reqPending && loadIdx === 8.U) {
+  //   printf("LOAD_KERNEL done, transitioning to COMPUTE\n")
+  // }
+
+  // // print first few compute cycles
+  // when(state === sCOMPUTE && outRow === 0.U && outCol < 4.U) {
+  //   printf("COMPUTE[%d][%d] = %d\n", outRow, outCol, conv.io.result >> 8)
+  // }
+
+  // // print window for output[0][0]
+  // when(state === sCOMPUTE && outRow === 0.U && outCol === 0.U) {
+  //   for (i <- 0 until 25) {
+  //     printf("window[%d]=%d kernel[%d]=%d\n", i.U, conv.io.window(i), i.U, conv.io.kernel(i))
+  //   }
+  // }
 
   // naive FSM
   switch(state) {
@@ -171,7 +205,16 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       }
       when(io.mem.resp.valid && reqPending) {
         reqPending := false.B
-        kernelBuffer(loadIdx) := io.mem.resp.bits.data(15, 0)
+        
+        kernelBuffer(kLoadRow * 5.U + kLoadCol) := io.mem.resp.bits.data(15, 0)
+        
+        when(kLoadCol === kernelSize - 1.U) {
+          kLoadCol := 0.U
+          kLoadRow := kLoadRow + 1.U
+        } .otherwise {
+          kLoadCol := kLoadCol + 1.U
+        }
+
         when(loadIdx === kernelLen - 1.U) {
           loadIdx := 0.U
           state := sCOMPUTE
@@ -205,7 +248,10 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         io.mem.req.bits.cmd := M_XWR
         io.mem.req.bits.size := 2.U
         io.mem.req.bits.tag := 0.U
-        io.mem.req.bits.data := outputBuffer(storeIdx >> 5)(storeIdx & 31.U)
+        
+        val outVal = outputBuffer(storeIdx >> 5)(storeIdx & 31.U)
+        io.mem.req.bits.data := Cat(outVal, outVal)
+        
         when(io.mem.req.ready) {
           reqPending := true.B
         }
