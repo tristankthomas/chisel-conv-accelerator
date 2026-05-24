@@ -21,7 +21,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val FUNC_POLL_STATUS = 2.U
 
   // FSM states
-  val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE :: sSTORE :: sWAIT_LAST_STORE :: sDONE :: Nil = Enum(7)
+  val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE :: sSTORE :: sDONE :: Nil = Enum(6)
   val state = RegInit(sIDLE)
 
   // queue incoming commands
@@ -168,6 +168,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
     // load entire input matrix
     is(sLOAD_INPUT) {
+
+      // send request if not waiting
       when(!reqPending) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := inputAddr + (loadIdx << 1)
@@ -179,8 +181,10 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         }
       }
       when(io.mem.resp.valid && reqPending) {
+        // data received
         reqPending := false.B
         inputBuffer(loadIdx >> 5)(loadIdx & 31.U) := io.mem.resp.bits.data(15, 0)
+        // increment index
         when(loadIdx === 1023.U) {
           loadIdx := 0.U
           state := sLOAD_KERNEL
@@ -193,6 +197,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     // load entire kernel
     is(sLOAD_KERNEL) {
       val kernelLen = (kernelSize * kernelSize)(5, 0)
+      // send request if none in flight
       when(!reqPending) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := kernelAddr + (loadIdx << 1)
@@ -206,8 +211,10 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       when(io.mem.resp.valid && reqPending) {
         reqPending := false.B
         
+        // flatten kernel buffer so padded with 0's to right and down
         kernelBuffer(kLoadRow * 5.U + kLoadCol) := io.mem.resp.bits.data(15, 0)
         
+        // iterate through input kernel size rows and cols
         when(kLoadCol === kernelSize - 1.U) {
           kLoadCol := 0.U
           kLoadRow := kLoadRow + 1.U
@@ -215,6 +222,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
           kLoadCol := kLoadCol + 1.U
         }
 
+        // iterate through all kernel elements
         when(loadIdx === kernelLen - 1.U) {
           loadIdx := 0.U
           state := sCOMPUTE
@@ -242,6 +250,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
     // store one element at a time, waiting for response
     is(sSTORE) {
+      // sends only if no requests in flight
       when(!reqPending) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := outputAddr + (storeIdx << 2)
@@ -265,17 +274,6 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         } .otherwise {
           storeIdx := storeIdx + 1.U
         }
-      }
-    }
-
-    // wait until all 1024 store acks received before signalling complete
-    is(sWAIT_LAST_STORE) {
-      when(io.mem.resp.valid) {
-        storeRespCount := storeRespCount + 1.U
-      }
-      when(storeRespCount === 1024.U) {
-        storeRespCount := 0.U
-        state := sDONE
       }
     }
 
