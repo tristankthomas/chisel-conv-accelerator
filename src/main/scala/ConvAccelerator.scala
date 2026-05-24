@@ -15,6 +15,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     extends LazyRoCCModuleImp(outer)
     with HasCoreParameters {
 
+  val MAX_INFLIGHT = 8
+
   // funct7 encodings
   val FUNC_SET_INPUT = 0.U
   val FUNC_START = 1.U
@@ -60,11 +62,20 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val outRow = RegInit(0.U(5.W))
   val outCol = RegInit(0.U(5.W))
 
-  val loadIdx = RegInit(0.U(11.W))
-  val storeIdx = RegInit(0.U(11.W))
+  // pipelined load counters
+  val reqIdx = RegInit(0.U(11.W))   // next element to request
+  val respIdx = RegInit(0.U(11.W))  // next element to receive
+  val inflightCount = RegInit(0.U(4.W))  // outstanding requests (max 8)
 
-  val reqPending = RegInit(false.B)
-  val storeRespCount = RegInit(0.U(11.W))
+  // store counters
+  val storeReqIdx = RegInit(0.U(11.W))
+  val storeRespIdx = RegInit(0.U(11.W))
+  val storeInflight = RegInit(0.U(4.W))
+
+  // kernel load counters
+  val kernelReqIdx = RegInit(0.U(5.W))
+  val kernelRespIdx = RegInit(0.U(5.W))
+  val kernelInflight = RegInit(0.U(4.W))
 
   // padding offset
   val pad = kernelSize >> 1
@@ -85,12 +96,17 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     kernelSize := cmd.bits.rs2
     done := false.B
     error := false.B
-    loadIdx := 0.U
-    storeIdx := 0.U
-    storeRespCount := 0.U
+    reqIdx := 0.U
+    respIdx := 0.U
+    inflightCount := 0.U
+    storeReqIdx := 0.U
+    storeRespIdx := 0.U
+    storeInflight := 0.U
+    kernelReqIdx := 0.U
+    kernelRespIdx := 0.U
+    kernelInflight := 0.U
     outRow := 0.U
     outCol := 0.U
-    reqPending := false.B
     kLoadRow := 0.U
     kLoadCol := 0.U
     mem_dprv := cmd.bits.status.dprv
@@ -106,7 +122,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     }
   }
 
-  // combinational window construction - generates 25 assigns
+  // combinational window construction
   for (ki <- 0 until 5) {
     for (kj <- 0 until 5) {
       val ii = outRow +& ki.U - pad
@@ -127,109 +143,57 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   io.mem.s1_kill := false.B
   io.mem.s2_kill := false.B
 
-
-
-    // debug
-  // when(io.mem.req.valid && io.mem.req.ready) {
-  //   printf("MEM REQ: state=%d addr=%x loadIdx=%d\n", state, io.mem.req.bits.addr, loadIdx)
-  // }
-
-  // // print when START fires
-  // when(cmd.fire && doStart) {
-  //   printf("START: kernelSize=%d pad=%d\n", cmd.bits.rs2, cmd.bits.rs2 >> 1)
-  // }
-
-  // // print state transitions
-  // when(state === sLOAD_INPUT && io.mem.resp.valid && reqPending && loadIdx === 1023.U) {
-  //   printf("LOAD_INPUT done, transitioning to LOAD_KERNEL\n")
-  // }
-  // when(state === sLOAD_KERNEL && io.mem.resp.valid && reqPending) {
-  //   printf("KERNEL[%d] = %x\n", loadIdx, io.mem.resp.bits.data(15, 0))
-  // }
-  // when(state === sLOAD_KERNEL && io.mem.resp.valid && reqPending && loadIdx === 8.U) {
-  //   printf("LOAD_KERNEL done, transitioning to COMPUTE\n")
-  // }
-
-  // // print first few compute cycles
-  // when(state === sCOMPUTE && outRow === 0.U && outCol < 4.U) {
-  //   printf("COMPUTE[%d][%d] = %d\n", outRow, outCol, conv.io.result >> 8)
-  // }
-
-  // // print window for output[0][0]
-  // when(state === sCOMPUTE && outRow === 0.U && outCol === 0.U) {
-  //   for (i <- 0 until 25) {
-  //     printf("window[%d]=%d kernel[%d]=%d\n", i.U, conv.io.window(i), i.U, conv.io.kernel(i))
-  //   }
-  // }
-
-  // naive FSM
+  // FSM
   switch(state) {
     is(sIDLE) { }
 
-    // load entire input matrix
+    // load entire input matrix with pipelined requests
     is(sLOAD_INPUT) {
+      val reqFire = inflightCount < MAX_INFLIGHT.U && reqIdx < 1024.U && io.mem.req.ready
+      val respFire = io.mem.resp.valid
 
-      // send request if not waiting
-      when(!reqPending) {
+      when(inflightCount < MAX_INFLIGHT.U && reqIdx < 1024.U) {
         io.mem.req.valid := true.B
-        io.mem.req.bits.addr := inputAddr + (loadIdx << 1)
+        io.mem.req.bits.addr := inputAddr + (reqIdx << 1)
         io.mem.req.bits.cmd := M_XRD
         io.mem.req.bits.size := 1.U
-        io.mem.req.bits.tag := 0.U
-        when(io.mem.req.ready) {
-          reqPending := true.B
-        }
+        io.mem.req.bits.tag := reqIdx(3, 0)
       }
-      when(io.mem.resp.valid && reqPending) {
-        // data received
-        reqPending := false.B
-        inputBuffer(loadIdx >> 5)(loadIdx & 31.U) := io.mem.resp.bits.data(15, 0)
-        // increment index
-        when(loadIdx === 1023.U) {
-          loadIdx := 0.U
-          state := sLOAD_KERNEL
-        } .otherwise {
-          loadIdx := loadIdx + 1.U
-        }
+      when(reqFire) { reqIdx := reqIdx + 1.U }
+      when(respFire) {
+        inputBuffer(respIdx >> 5)(respIdx & 31.U) := io.mem.resp.bits.data(15, 0)
+        respIdx := respIdx + 1.U
+        when(respIdx === 1023.U) { state := sLOAD_KERNEL }
       }
+      when(reqFire && !respFire) { inflightCount := inflightCount + 1.U }
+      .elsewhen(!reqFire && respFire) { inflightCount := inflightCount - 1.U }
     }
 
-    // load entire kernel
+    // load entire kernel with pipelined requests
     is(sLOAD_KERNEL) {
       val kernelLen = (kernelSize * kernelSize)(5, 0)
-      // send request if none in flight
-      when(!reqPending) {
+      val reqFire = kernelInflight < MAX_INFLIGHT.U && kernelReqIdx < kernelLen && io.mem.req.ready
+      val respFire = io.mem.resp.valid
+
+      when(kernelInflight < MAX_INFLIGHT.U && kernelReqIdx < kernelLen) {
         io.mem.req.valid := true.B
-        io.mem.req.bits.addr := kernelAddr + (loadIdx << 1)
+        io.mem.req.bits.addr := kernelAddr + (kernelReqIdx << 1)
         io.mem.req.bits.cmd := M_XRD
         io.mem.req.bits.size := 1.U
-        io.mem.req.bits.tag := 0.U
-        when(io.mem.req.ready) {
-          reqPending := true.B
-        }
+        io.mem.req.bits.tag := kernelReqIdx(3, 0)
       }
-      when(io.mem.resp.valid && reqPending) {
-        reqPending := false.B
-        
-        // flatten kernel buffer so padded with 0's to right and down
+      when(reqFire) { kernelReqIdx := kernelReqIdx + 1.U }
+      when(respFire) {
         kernelBuffer(kLoadRow * 5.U + kLoadCol) := io.mem.resp.bits.data(15, 0)
-        
-        // iterate through input kernel size rows and cols
         when(kLoadCol === kernelSize - 1.U) {
           kLoadCol := 0.U
           kLoadRow := kLoadRow + 1.U
-        } .otherwise {
-          kLoadCol := kLoadCol + 1.U
-        }
-
-        // iterate through all kernel elements
-        when(loadIdx === kernelLen - 1.U) {
-          loadIdx := 0.U
-          state := sCOMPUTE
-        } .otherwise {
-          loadIdx := loadIdx + 1.U
-        }
+        } .otherwise { kLoadCol := kLoadCol + 1.U }
+        kernelRespIdx := kernelRespIdx + 1.U
+        when(kernelRespIdx === kernelLen - 1.U) { state := sCOMPUTE }
       }
+      when(reqFire && !respFire) { kernelInflight := kernelInflight + 1.U }
+      .elsewhen(!reqFire && respFire) { kernelInflight := kernelInflight - 1.U }
     }
 
     // compute one element per cycle
@@ -248,33 +212,27 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       }
     }
 
-    // store one element at a time, waiting for response
+    // store entire output matrix with pipelined requests
     is(sSTORE) {
-      // sends only if no requests in flight
-      when(!reqPending) {
+      val reqFire = storeInflight < MAX_INFLIGHT.U && storeReqIdx < 1024.U && io.mem.req.ready
+      val respFire = io.mem.resp.valid
+
+      when(storeInflight < MAX_INFLIGHT.U && storeReqIdx < 1024.U) {
         io.mem.req.valid := true.B
-        io.mem.req.bits.addr := outputAddr + (storeIdx << 2)
+        io.mem.req.bits.addr := outputAddr + (storeReqIdx << 2)
         io.mem.req.bits.cmd := M_XWR
         io.mem.req.bits.size := 2.U
-        io.mem.req.bits.tag := 0.U
-        
-        val outVal = outputBuffer(storeIdx >> 5)(storeIdx & 31.U)
+        io.mem.req.bits.tag := storeReqIdx(3, 0)
+        val outVal = outputBuffer(storeReqIdx >> 5)(storeReqIdx & 31.U)
         io.mem.req.bits.data := Cat(outVal, outVal)
-        
-        when(io.mem.req.ready) {
-          reqPending := true.B
-        }
       }
-      
-      when(io.mem.resp.valid && reqPending) {
-        reqPending := false.B
-        when(storeIdx === 1023.U) {
-          storeIdx := 0.U
-          state := sDONE
-        } .otherwise {
-          storeIdx := storeIdx + 1.U
-        }
+      when(reqFire) { storeReqIdx := storeReqIdx + 1.U }
+      when(respFire) {
+        storeRespIdx := storeRespIdx + 1.U
+        when(storeRespIdx === 1023.U) { state := sDONE }
       }
+      when(reqFire && !respFire) { storeInflight := storeInflight + 1.U }
+      .elsewhen(!reqFire && respFire) { storeInflight := storeInflight - 1.U }
     }
 
     // convolution complete
@@ -298,28 +256,4 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   io.busy := state =/= sIDLE
   io.interrupt := false.B
-
 }
-
-
-// function convolve(input[32][32], kernel[K][K], output[32][32]):
-//     pad = K / 2
-
-//     for i = 0 to 31:
-//         for j = 0 to 31:
-//             window = extract_window(input, i, j, pad)
-//             output[i][j] = conv(window, kernel) >> 8
-
-// function extract_window(input, i, j, pad):
-//     for ki = 0 to K-1:
-//         for kj = 0 to K-1:
-//             ii = i + ki - pad
-//             jj = j + kj - pad
-//             if ii >= 0 and ii < 32 and jj >= 0 and jj < 32:
-//                 window[ki][kj] = input[ii][jj]
-//             else:
-//                 window[ki][kj] = 0
-//     return window
-
-// function conv(window[K][K], kernel[K][K]):
-//     return sum(window[i][j] * kernel[i][j] for all i, j)
