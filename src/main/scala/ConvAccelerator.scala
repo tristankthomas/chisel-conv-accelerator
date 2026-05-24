@@ -148,29 +148,36 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     is(sIDLE) { }
 
     // load entire input matrix with pipelined requests
-    is(sLOAD_INPUT) {
-      val reqFire = inflightCount < MAX_INFLIGHT.U && reqIdx < 1024.U && io.mem.req.ready
-      val respFire = io.mem.resp.valid
+is(sLOAD_INPUT) {
+    // 64-bit loads: 4 elements per request, 256 requests total
+    val reqFire = inflightCount < MAX_INFLIGHT.U && reqIdx < 256.U && io.mem.req.ready
+    val respFire = io.mem.resp.valid
 
-      when(inflightCount < MAX_INFLIGHT.U && reqIdx < 1024.U) {
-        io.mem.req.valid := true.B
-        io.mem.req.bits.addr := inputAddr + (reqIdx << 1)
-        io.mem.req.bits.cmd := M_XRD
-        io.mem.req.bits.size := 1.U
-        io.mem.req.bits.tag := reqIdx(3, 0)
-      }
-      when(reqFire) { reqIdx := reqIdx + 1.U }
-      when(respFire) {
-        inputBuffer(respIdx >> 5)(respIdx & 31.U) := io.mem.resp.bits.data(15, 0)
-        respIdx := respIdx + 1.U
-        when(respIdx === 1023.U) { state := sLOAD_KERNEL }
-      }
-      when(reqFire && !respFire) { inflightCount := inflightCount + 1.U }
-      .elsewhen(!reqFire && respFire) { inflightCount := inflightCount - 1.U }
+    when(inflightCount < MAX_INFLIGHT.U && reqIdx < 256.U) {
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := inputAddr + (reqIdx << 3)  // * 8 bytes per request
+      io.mem.req.bits.cmd := M_XRD
+      io.mem.req.bits.size := 3.U  // 64-bit
+      io.mem.req.bits.tag := reqIdx(3, 0)
     }
+    when(reqFire) { reqIdx := reqIdx + 1.U }
+    when(respFire) {
+      // unpack 4 x 16-bit elements from 64-bit response
+      val base = respIdx << 2
+      inputBuffer(base >> 5)(base & 31.U) := io.mem.resp.bits.data(15, 0)
+      inputBuffer((base + 1.U) >> 5)((base + 1.U) & 31.U) := io.mem.resp.bits.data(31, 16)
+      inputBuffer((base + 2.U) >> 5)((base + 2.U) & 31.U) := io.mem.resp.bits.data(47, 32)
+      inputBuffer((base + 3.U) >> 5)((base + 3.U) & 31.U) := io.mem.resp.bits.data(63, 48)
+      respIdx := respIdx + 1.U
+      when(respIdx === 255.U) { state := sLOAD_KERNEL }
+    }
+    when(reqFire && !respFire) { inflightCount := inflightCount + 1.U }
+    .elsewhen(!reqFire && respFire) { inflightCount := inflightCount - 1.U }
+  }
 
     // load entire kernel with pipelined requests
     is(sLOAD_KERNEL) {
+      // kernel is small (max 25 elements = 50 bytes) keep 16-bit loads for simplicity
       val kernelLen = (kernelSize * kernelSize)(5, 0)
       val reqFire = kernelInflight < MAX_INFLIGHT.U && kernelReqIdx < kernelLen && io.mem.req.ready
       val respFire = io.mem.resp.valid
@@ -214,22 +221,25 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
     // store entire output matrix with pipelined requests
     is(sSTORE) {
-      val reqFire = storeInflight < MAX_INFLIGHT.U && storeReqIdx < 1024.U && io.mem.req.ready
+      // 64-bit stores: pack 2 x 32-bit elements per request, 512 requests total
+      val reqFire = storeInflight < MAX_INFLIGHT.U && storeReqIdx < 512.U && io.mem.req.ready
       val respFire = io.mem.resp.valid
 
-      when(storeInflight < MAX_INFLIGHT.U && storeReqIdx < 1024.U) {
+      when(storeInflight < MAX_INFLIGHT.U && storeReqIdx < 512.U) {
         io.mem.req.valid := true.B
-        io.mem.req.bits.addr := outputAddr + (storeReqIdx << 2)
+        io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)  // * 8 bytes per request
         io.mem.req.bits.cmd := M_XWR
-        io.mem.req.bits.size := 2.U
+        io.mem.req.bits.size := 3.U  // 64-bit
         io.mem.req.bits.tag := storeReqIdx(3, 0)
-        val outVal = outputBuffer(storeReqIdx >> 5)(storeReqIdx & 31.U)
-        io.mem.req.bits.data := Cat(outVal, outVal)
+        val base = storeReqIdx << 1
+        val outVal0 = outputBuffer(base >> 5)(base & 31.U)
+        val outVal1 = outputBuffer((base + 1.U) >> 5)((base + 1.U) & 31.U)
+        io.mem.req.bits.data := Cat(outVal1, outVal0)  // pack 2 elements
       }
       when(reqFire) { storeReqIdx := storeReqIdx + 1.U }
       when(respFire) {
         storeRespIdx := storeRespIdx + 1.U
-        when(storeRespIdx === 1023.U) { state := sDONE }
+        when(storeRespIdx === 511.U) { state := sDONE }
       }
       when(reqFire && !respFire) { storeInflight := storeInflight + 1.U }
       .elsewhen(!reqFire && respFire) { storeInflight := storeInflight - 1.U }
