@@ -3,6 +3,7 @@ package convaccelerator
 import chisel3._
 import chisel3.util._
 import hardfloat._
+import scala.language.reflectiveCalls
 
 class ConvolutionFP extends Module {
   val io = IO(new Bundle {

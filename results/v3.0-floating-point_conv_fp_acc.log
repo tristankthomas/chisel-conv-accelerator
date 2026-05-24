@@ -1,0 +1,7 @@
+[UART] UART0 is here (stdin/stdout).
+raw bits: [0][0]=0x3ee38e39 [16][16]=0x3f800000
+corners:  [0][0]=444 [0][31]=444 [31][0]=444 [31][31]=444
+edges:    [0][1]=666 [1][0]=666 [0][16]=666 [16][0]=666
+centre:   [16][16]=1000 [15][15]=1000
+Hardware FP convolution took 2127 cycles
+- /home/trist/chipyard/sims/verilator/generated-src/chipyard.harness.TestHarness.ConvAcceleratorConfig/gen-collateral/TestDriver.v:158: Verilog $finish

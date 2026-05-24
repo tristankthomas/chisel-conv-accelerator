@@ -19,8 +19,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   // funct7 encodings
   val FUNC_SET_INPUT = 0.U
-  val FUNC_START = 1.U
+  val FUNC_START_INT = 1.U
   val FUNC_POLL_STATUS = 2.U
+  val FUNC_START_FP = 3.U
 
   // FSM states
   val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE :: sSTORE :: sDONE :: Nil = Enum(6)
@@ -32,7 +33,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   // decode instruction
   val funct7 = cmd.bits.inst.funct
   val doSetInput = funct7 === FUNC_SET_INPUT
-  val doStart = funct7 === FUNC_START
+  val doStart = funct7 === FUNC_START_INT || funct7 === FUNC_START_FP
   val doPoll = funct7 === FUNC_POLL_STATUS
   val doResp = cmd.bits.inst.xd
 
@@ -41,6 +42,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val kernelAddr = RegInit(0.U(xLen.W))
   val outputAddr = RegInit(0.U(xLen.W))
   val kernelSize = RegInit(0.U(xLen.W))
+  val isFloatMode = RegInit(false.B)
 
   // status registers
   val done = RegInit(false.B)
@@ -53,9 +55,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val kLoadRow = RegInit(0.U(3.W))
   val kLoadCol = RegInit(0.U(3.W))
 
-  // internal buffers
-  val inputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(16.W))))))
-  val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(16.W))))
+  // unified 32-bit buffers for both modes
+  val inputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(32.W))))))
+  val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(32.W))))
   val outputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(32.W))))))
 
   // compute counters
@@ -63,9 +65,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val outCol = RegInit(0.U(5.W))
 
   // pipelined load counters
-  val reqIdx = RegInit(0.U(11.W))   // next element to request
-  val respIdx = RegInit(0.U(11.W))  // next element to receive
-  val inflightCount = RegInit(0.U(4.W))  // outstanding requests (max 8)
+  val reqIdx = RegInit(0.U(11.W))
+  val respIdx = RegInit(0.U(11.W))
+  val inflightCount = RegInit(0.U(4.W))
 
   // store counters
   val storeReqIdx = RegInit(0.U(11.W))
@@ -80,9 +82,13 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   // padding offset
   val pad = kernelSize >> 1
 
-  // convolution engine
+  // fixed point convolution engine - uses lower 16 bits of unified buffer
   val conv = Module(new Convolution())
-  conv.io.kernel := kernelBuffer
+  conv.io.kernel := VecInit(kernelBuffer.map(_(15, 0)))
+
+  // floating point convolution engine - uses full 32 bits
+  val convFP = Module(new ConvolutionFP())
+  convFP.io.kernel := kernelBuffer
 
   // handle SET_INPUT
   when(cmd.fire && doSetInput) {
@@ -90,8 +96,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     outputAddr := cmd.bits.rs2
   }
 
-  // handle START
+  // handle START (both int and fp)
   when(cmd.fire && doStart) {
+    isFloatMode := (funct7 === FUNC_START_FP)
     kernelAddr := cmd.bits.rs1
     kernelSize := cmd.bits.rs2
     done := false.B
@@ -122,13 +129,16 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     }
   }
 
-  // combinational window construction
+  // combinational window construction for both modules
   for (ki <- 0 until 5) {
     for (kj <- 0 until 5) {
       val ii = outRow +& ki.U - pad
       val jj = outCol +& kj.U - pad
       val inBounds = ii < 32.U && jj < 32.U
-      conv.io.window(ki * 5 + kj) := Mux(inBounds, inputBuffer(ii)(jj), 0.U(16.W))
+      // fixed point gets lower 16 bits
+      conv.io.window(ki * 5 + kj) := Mux(inBounds, inputBuffer(ii)(jj)(15, 0), 0.U(16.W))
+      // fp gets full 32 bits
+      convFP.io.window(ki * 5 + kj) := Mux(inBounds, inputBuffer(ii)(jj), 0.U(32.W))
     }
   }
 
@@ -147,51 +157,62 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   switch(state) {
     is(sIDLE) { }
 
-    // load entire input matrix with pipelined requests
-is(sLOAD_INPUT) {
-    // 64-bit loads: 4 elements per request, 256 requests total
-    val reqFire = inflightCount < MAX_INFLIGHT.U && reqIdx < 256.U && io.mem.req.ready
-    val respFire = io.mem.resp.valid
+    // load entire input matrix with pipelined 64-bit requests
+    is(sLOAD_INPUT) {
+      // fp: 512 requests (2x32-bit), int: 256 requests (4x16-bit)
+      val maxReq = Mux(isFloatMode, 512.U, 256.U)
+      val maxResp = Mux(isFloatMode, 511.U, 255.U)
+      val reqFire = inflightCount < MAX_INFLIGHT.U && reqIdx < maxReq && io.mem.req.ready
+      val respFire = io.mem.resp.valid
 
-    when(inflightCount < MAX_INFLIGHT.U && reqIdx < 256.U) {
-      io.mem.req.valid := true.B
-      io.mem.req.bits.addr := inputAddr + (reqIdx << 3)  // * 8 bytes per request
-      io.mem.req.bits.cmd := M_XRD
-      io.mem.req.bits.size := 3.U  // 64-bit
-      io.mem.req.bits.tag := reqIdx(3, 0)
+      when(inflightCount < MAX_INFLIGHT.U && reqIdx < maxReq) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := inputAddr + (reqIdx << 3)
+        io.mem.req.bits.cmd := M_XRD
+        io.mem.req.bits.size := 3.U
+        io.mem.req.bits.tag := reqIdx(3, 0)
+      }
+      when(reqFire) { reqIdx := reqIdx + 1.U }
+      when(respFire) {
+        when(isFloatMode) {
+          // unpack 2 x 32-bit floats
+          val base = respIdx << 1
+          inputBuffer(base >> 5)(base & 31.U) := io.mem.resp.bits.data(31, 0)
+          inputBuffer((base+1.U) >> 5)((base+1.U) & 31.U) := io.mem.resp.bits.data(63, 32)
+        } .otherwise {
+          // unpack 4 x 16-bit fixed point into lower 16 bits of 32-bit slots
+          val base = respIdx << 2
+          inputBuffer(base >> 5)(base & 31.U) := io.mem.resp.bits.data(15, 0)
+          inputBuffer((base+1.U) >> 5)((base+1.U) & 31.U) := io.mem.resp.bits.data(31, 16)
+          inputBuffer((base+2.U) >> 5)((base+2.U) & 31.U) := io.mem.resp.bits.data(47, 32)
+          inputBuffer((base+3.U) >> 5)((base+3.U) & 31.U) := io.mem.resp.bits.data(63, 48)
+        }
+        respIdx := respIdx + 1.U
+        when(respIdx === maxResp) { state := sLOAD_KERNEL }
+      }
+      when(reqFire && !respFire) { inflightCount := inflightCount + 1.U }
+      .elsewhen(!reqFire && respFire) { inflightCount := inflightCount - 1.U }
     }
-    when(reqFire) { reqIdx := reqIdx + 1.U }
-    when(respFire) {
-      // unpack 4 x 16-bit elements from 64-bit response
-      val base = respIdx << 2
-      inputBuffer(base >> 5)(base & 31.U) := io.mem.resp.bits.data(15, 0)
-      inputBuffer((base + 1.U) >> 5)((base + 1.U) & 31.U) := io.mem.resp.bits.data(31, 16)
-      inputBuffer((base + 2.U) >> 5)((base + 2.U) & 31.U) := io.mem.resp.bits.data(47, 32)
-      inputBuffer((base + 3.U) >> 5)((base + 3.U) & 31.U) := io.mem.resp.bits.data(63, 48)
-      respIdx := respIdx + 1.U
-      when(respIdx === 255.U) { state := sLOAD_KERNEL }
-    }
-    when(reqFire && !respFire) { inflightCount := inflightCount + 1.U }
-    .elsewhen(!reqFire && respFire) { inflightCount := inflightCount - 1.U }
-  }
 
     // load entire kernel with pipelined requests
     is(sLOAD_KERNEL) {
-      // kernel is small (max 25 elements = 50 bytes) keep 16-bit loads for simplicity
       val kernelLen = (kernelSize * kernelSize)(5, 0)
       val reqFire = kernelInflight < MAX_INFLIGHT.U && kernelReqIdx < kernelLen && io.mem.req.ready
       val respFire = io.mem.resp.valid
 
       when(kernelInflight < MAX_INFLIGHT.U && kernelReqIdx < kernelLen) {
         io.mem.req.valid := true.B
-        io.mem.req.bits.addr := kernelAddr + (kernelReqIdx << 1)
+        io.mem.req.bits.addr := kernelAddr + Mux(isFloatMode, kernelReqIdx << 2, kernelReqIdx << 1)
         io.mem.req.bits.cmd := M_XRD
-        io.mem.req.bits.size := 1.U
+        io.mem.req.bits.size := Mux(isFloatMode, 2.U, 1.U)  // 32-bit for fp, 16-bit for int
         io.mem.req.bits.tag := kernelReqIdx(3, 0)
       }
       when(reqFire) { kernelReqIdx := kernelReqIdx + 1.U }
       when(respFire) {
-        kernelBuffer(kLoadRow * 5.U + kLoadCol) := io.mem.resp.bits.data(15, 0)
+        // fp: full 32-bit float, int: lower 16 bits zero-extended
+        kernelBuffer(kLoadRow * 5.U + kLoadCol) := Mux(isFloatMode,
+          io.mem.resp.bits.data(31, 0),
+          io.mem.resp.bits.data(15, 0))
         when(kLoadCol === kernelSize - 1.U) {
           kLoadCol := 0.U
           kLoadRow := kLoadRow + 1.U
@@ -203,9 +224,10 @@ is(sLOAD_INPUT) {
       .elsewhen(!reqFire && respFire) { kernelInflight := kernelInflight - 1.U }
     }
 
-    // compute one element per cycle
+    // compute one element per cycle, mux between fp and int
     is(sCOMPUTE) {
-      outputBuffer(outRow)(outCol) := conv.io.result >> 8
+      val result = Mux(isFloatMode, convFP.io.result, conv.io.result >> 8)
+      outputBuffer(outRow)(outCol) := result
       when(outCol === 31.U) {
         outCol := 0.U
         when(outRow === 31.U) {
@@ -219,22 +241,22 @@ is(sLOAD_INPUT) {
       }
     }
 
-    // store entire output matrix with pipelined requests
+    // store entire output matrix with pipelined 64-bit requests
     is(sSTORE) {
-      // 64-bit stores: pack 2 x 32-bit elements per request, 512 requests total
+      // both modes: 512 requests, 2 x 32-bit elements per request
       val reqFire = storeInflight < MAX_INFLIGHT.U && storeReqIdx < 512.U && io.mem.req.ready
       val respFire = io.mem.resp.valid
 
       when(storeInflight < MAX_INFLIGHT.U && storeReqIdx < 512.U) {
         io.mem.req.valid := true.B
-        io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)  // * 8 bytes per request
+        io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)
         io.mem.req.bits.cmd := M_XWR
-        io.mem.req.bits.size := 3.U  // 64-bit
+        io.mem.req.bits.size := 3.U
         io.mem.req.bits.tag := storeReqIdx(3, 0)
         val base = storeReqIdx << 1
         val outVal0 = outputBuffer(base >> 5)(base & 31.U)
-        val outVal1 = outputBuffer((base + 1.U) >> 5)((base + 1.U) & 31.U)
-        io.mem.req.bits.data := Cat(outVal1, outVal0)  // pack 2 elements
+        val outVal1 = outputBuffer((base+1.U) >> 5)((base+1.U) & 31.U)
+        io.mem.req.bits.data := Cat(outVal1, outVal0)
       }
       when(reqFire) { storeReqIdx := storeReqIdx + 1.U }
       when(respFire) {
