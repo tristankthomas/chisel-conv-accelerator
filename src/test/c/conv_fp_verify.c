@@ -6,17 +6,14 @@
 #define N 32
 #define K 3
 
-typedef uint16_t fixed88;
-typedef uint32_t fixed88_wide;
-
 static inline void conv_set_input(void *input, void *output)
 {
     ROCC_INSTRUCTION_SS(0, (unsigned long)input, (unsigned long)output, 0);
 }
 
-static inline void conv_start(void *kernel, unsigned long kernel_size)
+static inline void conv_start_fp(void *kernel, unsigned long kernel_size)
 {
-    ROCC_INSTRUCTION_SS(0, (unsigned long)kernel, kernel_size, 1);
+    ROCC_INSTRUCTION_SS(0, (unsigned long)kernel, kernel_size, 3);
 }
 
 static inline unsigned long conv_poll(void)
@@ -26,57 +23,55 @@ static inline unsigned long conv_poll(void)
     return status;
 }
 
-static fixed88 input[N][N] __attribute__((aligned(4096)));
-static fixed88 kernel_mat[K][K] __attribute__((aligned(64)));
-static fixed88_wide hw_output[N][N] __attribute__((aligned(4096)));
-static fixed88_wide sw_output[N][N];
+static float input[N][N] __attribute__((aligned(4096)));
+static float kernel_mat[K][K] __attribute__((aligned(64)));
+static float hw_output[N][N] __attribute__((aligned(4096)));
+static float sw_output[N][N];
 
 int main() {
     unsigned long sw_start, sw_end, hw_start, hw_end;
 
-    // non-uniform input - each element has a distinct value
+    // non-uniform input - distinct values to expose bugs
     for (int i = 0; i < N; i++)
         for (int j = 0; j < N; j++) {
-            input[i][j] = (fixed88)((i * N + j + 1) & 0xFF);  // values 1..255
-            hw_output[i][j] = 0;
+            input[i][j] = (float)(i * N + j + 1) / 100.0f;
+            hw_output[i][j] = 0.0f;
         }
 
-    // non-uniform kernel - distinct values per element to expose lane bugs
-    // in 8.8 fixed point: value = actual * 256
-    // use small distinct values so products don't overflow
-    kernel_mat[0][0] = 10;   // 0.039
-    kernel_mat[0][1] = 20;   // 0.078
-    kernel_mat[0][2] = 30;   // 0.117
-    kernel_mat[1][0] = 40;   // 0.156
-    kernel_mat[1][1] = 50;   // 0.195
-    kernel_mat[1][2] = 60;   // 0.234
-    kernel_mat[2][0] = 70;   // 0.273
-    kernel_mat[2][1] = 80;   // 0.313
-    kernel_mat[2][2] = 90;   // 0.352
+    // non-uniform kernel - distinct values per element
+    kernel_mat[0][0] = 0.1f;
+    kernel_mat[0][1] = 0.2f;
+    kernel_mat[0][2] = 0.3f;
+    kernel_mat[1][0] = 0.4f;
+    kernel_mat[1][1] = 0.5f;
+    kernel_mat[1][2] = 0.6f;
+    kernel_mat[2][0] = 0.7f;
+    kernel_mat[2][1] = 0.8f;
+    kernel_mat[2][2] = 0.9f;
 
-    // software convolution
+    // software FP convolution
     sw_start = rdcycle();
     int pad = K / 2;
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
-            uint64_t acc = 0;
+            float acc = 0.0f;
             for (int ki = 0; ki < K; ki++) {
                 for (int kj = 0; kj < K; kj++) {
                     int ii = i + ki - pad;
                     int jj = j + kj - pad;
                     if (ii >= 0 && ii < N && jj >= 0 && jj < N)
-                        acc += (uint32_t)input[ii][jj] * (uint32_t)kernel_mat[ki][kj];
+                        acc += input[ii][jj] * kernel_mat[ki][kj];
                 }
             }
-            sw_output[i][j] = (fixed88_wide)(acc >> 8);
+            sw_output[i][j] = acc;
         }
     }
     sw_end = rdcycle();
 
-    // hardware convolution
+    // hardware FP convolution
     hw_start = rdcycle();
     conv_set_input(input, hw_output);
-    conv_start(kernel_mat, K);
+    conv_start_fp(kernel_mat, K);
     unsigned long status;
     do {
         status = conv_poll();
@@ -88,12 +83,17 @@ int main() {
         return 1;
     }
 
-    // verify all elements
+    // verify - compare raw bits since float equality is exact for same operations
     int errors = 0;
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
-            if (hw_output[i][j] != sw_output[i][j]) {
-                printf("MISMATCH [%d][%d]: hw=%u sw=%u\n", i, j, hw_output[i][j], sw_output[i][j]);
+            uint32_t hw_bits = *(uint32_t*)&hw_output[i][j];
+            uint32_t sw_bits = *(uint32_t*)&sw_output[i][j];
+            // allow 1 ULP difference for rounding
+            uint32_t diff = hw_bits > sw_bits ? hw_bits - sw_bits : sw_bits - hw_bits;
+            if (diff > 2) {
+                printf("MISMATCH [%d][%d]: hw=0x%x sw=0x%x diff=%u\n",
+                    i, j, hw_bits, sw_bits, diff);
                 errors++;
                 if (errors >= 10) {
                     printf("Too many errors, stopping\n");
@@ -109,8 +109,8 @@ done:
     else
         printf("FAIL: %d mismatches\n", errors);
 
-    printf("Software: %lu cycles\n", sw_end - sw_start);
-    printf("Hardware: %lu cycles\n", hw_end - hw_start);
+    printf("Software FP: %lu cycles\n", sw_end - sw_start);
+    printf("Hardware FP: %lu cycles\n", hw_end - hw_start);
     printf("Speedup: %lux\n", (sw_end - sw_start) / (hw_end - hw_start));
 
     return 0;

@@ -6,6 +6,7 @@ import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.tile._
+import scala.language.reflectiveCalls
 
 class ConvAccelerator(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
   override lazy val module = new ConvAcceleratorModuleImp(this)
@@ -24,7 +25,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val FUNC_START_FP = 3.U
 
   // FSM states
-  val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE :: sSTORE :: sDONE :: Nil = Enum(6)
+  val sIDLE :: sLOAD_INPUT :: sLOAD_KERNEL :: sCOMPUTE_STORE :: sDONE :: Nil = Enum(5)
   val state = RegInit(sIDLE)
 
   // queue incoming commands
@@ -58,7 +59,11 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   // unified 32-bit buffers for both modes
   val inputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(32.W))))))
   val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(32.W))))
-  val outputBuffer = RegInit(VecInit(Seq.fill(32)(VecInit(Seq.fill(32)(0.U(32.W))))))
+
+  // output streaming registers - buffer 2 elements then fire 64-bit store
+  val stagingVal = RegInit(0.U(32.W))
+  val stagingFull = RegInit(false.B)
+  val computeIdx = RegInit(0.U(11.W))
 
   // compute counters
   val outRow = RegInit(0.U(5.W))
@@ -112,6 +117,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     kernelReqIdx := 0.U
     kernelRespIdx := 0.U
     kernelInflight := 0.U
+    stagingVal := 0.U
+    stagingFull := false.B
+    computeIdx := 0.U
     outRow := 0.U
     outCol := 0.U
     kLoadRow := 0.U
@@ -209,7 +217,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       }
       when(reqFire) { kernelReqIdx := kernelReqIdx + 1.U }
       when(respFire) {
-        // fp: full 32-bit float, int: lower 16 bits zero-extended
+        // HellaCache automatically aligns sub-word reads to LSBs - no lane steering needed
         kernelBuffer(kLoadRow * 5.U + kLoadCol) := Mux(isFloatMode,
           io.mem.resp.bits.data(31, 0),
           io.mem.resp.bits.data(15, 0))
@@ -218,53 +226,57 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
           kLoadRow := kLoadRow + 1.U
         } .otherwise { kLoadCol := kLoadCol + 1.U }
         kernelRespIdx := kernelRespIdx + 1.U
-        when(kernelRespIdx === kernelLen - 1.U) { state := sCOMPUTE }
+        when(kernelRespIdx === kernelLen - 1.U) { state := sCOMPUTE_STORE }
       }
       when(reqFire && !respFire) { kernelInflight := kernelInflight + 1.U }
       .elsewhen(!reqFire && respFire) { kernelInflight := kernelInflight - 1.U }
     }
 
-    // compute one element per cycle, mux between fp and int
-    is(sCOMPUTE) {
+    // compute and stream output directly to memory
+    is(sCOMPUTE_STORE) {
       val result = Mux(isFloatMode, convFP.io.result, conv.io.result >> 8)
-      outputBuffer(outRow)(outCol) := result
-      when(outCol === 31.U) {
-        outCol := 0.U
-        when(outRow === 31.U) {
-          outRow := 0.U
-          state := sSTORE
-        } .otherwise {
-          outRow := outRow + 1.U
-        }
-      } .otherwise {
-        outCol := outCol + 1.U
-      }
-    }
-
-    // store entire output matrix with pipelined 64-bit requests
-    is(sSTORE) {
-      // both modes: 512 requests, 2 x 32-bit elements per request
-      val reqFire = storeInflight < MAX_INFLIGHT.U && storeReqIdx < 512.U && io.mem.req.ready
       val respFire = io.mem.resp.valid
+      val reqFireStore = stagingFull && storeInflight < MAX_INFLIGHT.U && io.mem.req.ready
 
-      when(storeInflight < MAX_INFLIGHT.U && storeReqIdx < 512.U) {
+      // issue store request - valid never depends on ready
+      when(stagingFull && storeInflight < MAX_INFLIGHT.U) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)
         io.mem.req.bits.cmd := M_XWR
         io.mem.req.bits.size := 3.U
         io.mem.req.bits.tag := storeReqIdx(3, 0)
-        val base = storeReqIdx << 1
-        val outVal0 = outputBuffer(base >> 5)(base & 31.U)
-        val outVal1 = outputBuffer((base+1.U) >> 5)((base+1.U) & 31.U)
-        io.mem.req.bits.data := Cat(outVal1, outVal0)
+        io.mem.req.bits.data := Cat(result, stagingVal)
       }
-      when(reqFire) { storeReqIdx := storeReqIdx + 1.U }
+
+      // advance compute only when not stalled waiting for store
+      val canCompute = computeIdx < 1024.U && (!stagingFull || reqFireStore)
+
+      when(canCompute) {
+        computeIdx := computeIdx + 1.U
+        when(outCol === 31.U) {
+          outCol := 0.U
+          when(outRow =/= 31.U) { outRow := outRow + 1.U }
+        } .otherwise {
+          outCol := outCol + 1.U
+        }
+        when(!stagingFull) {
+          stagingVal := result
+          stagingFull := true.B
+        } .otherwise {
+          stagingFull := false.B
+          storeReqIdx := storeReqIdx + 1.U
+        }
+      }
+
+      // handle store responses
       when(respFire) {
         storeRespIdx := storeRespIdx + 1.U
         when(storeRespIdx === 511.U) { state := sDONE }
       }
-      when(reqFire && !respFire) { storeInflight := storeInflight + 1.U }
-      .elsewhen(!reqFire && respFire) { storeInflight := storeInflight - 1.U }
+
+      // net change inflight counter
+      when(reqFireStore && !respFire) { storeInflight := storeInflight + 1.U }
+      .elsewhen(!reqFireStore && respFire) { storeInflight := storeInflight - 1.U }
     }
 
     // convolution complete
