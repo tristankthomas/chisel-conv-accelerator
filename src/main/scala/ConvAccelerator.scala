@@ -16,7 +16,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     extends LazyRoCCModuleImp(outer)
     with HasCoreParameters {
 
-  val MAX_INFLIGHT = 8
+  val MAX_INFLIGHT = 16
+  val PARALLEL = 4  // output elements computed per cycle
+  val FP_PARALLEL = 2 // fp bus-limited to 2x32=64 bits
 
   // funct7 encodings
   val FUNC_SET_INPUT = 0.U
@@ -58,17 +60,17 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
   // line buffer - 6 rows max to allow N+1 streaming for 5x5 kernels
   val lineBuffer = RegInit(VecInit(Seq.fill(6)(VecInit(Seq.fill(32)(0.U(32.W))))))
-  val rowsLoaded = RegInit(0.U(6.W))      // total rows loaded so far
-  val loadRowReqIdx = RegInit(0.U(11.W))  // input load request index
-  val loadRowRespIdx = RegInit(0.U(11.W)) // input load response index
-  val loadInflight = RegInit(0.U(4.W))    // inflight input load requests
+  val rowsLoaded = RegInit(0.U(6.W))
+  val loadRowReqIdx = RegInit(0.U(11.W))
+  val loadRowRespIdx = RegInit(0.U(11.W))
+  val loadInflight = RegInit(0.U(4.W))
 
   // kernel buffer
   val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(32.W))))
 
   // output streaming registers
-  val stagingVal = RegInit(0.U(48.W))
-  val stageCount = RegInit(0.U(2.W))
+  val stagingVal = RegInit(0.U(64.W))
+  val stagingValid = RegInit(false.B) // true when stagingVal has fresh data ready for the bus
   val computeIdx = RegInit(0.U(11.W))
 
   // compute counters
@@ -88,13 +90,13 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   // padding offset
   val pad = kernelSize >> 1
 
-  // fixed point convolution engine - uses lower 16 bits of unified buffer
-  val conv = Module(new Convolution())
-  conv.io.kernel := VecInit(kernelBuffer.map(_(15, 0)))
+  // PARALLEL fixed point convolution engines
+  val convs = Seq.fill(PARALLEL)(Module(new Convolution()))
+  convs.foreach(_.io.kernel := VecInit(kernelBuffer.map(_(15, 0))))
 
-  // floating point convolution engine - uses full 32 bits
-  val convFP = Module(new ConvolutionFP())
-  convFP.io.kernel := kernelBuffer
+  // FP_PARALLEL floating point convolution engines (only instantiate 2)
+  val convFPs = Seq.fill(FP_PARALLEL)(Module(new ConvolutionFP()))
+  convFPs.foreach(_.io.kernel := kernelBuffer)
 
   // handle SET_INPUT
   when(cmd.fire && doSetInput) {
@@ -120,7 +122,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     kernelRespIdx := 0.U
     kernelInflight := 0.U
     stagingVal := 0.U
-    stageCount := 0.U
+    stagingValid := false.B
     computeIdx := 0.U
     outRow := 0.U
     outCol := 0.U
@@ -139,20 +141,23 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     }
   }
 
-// combinational window construction using absolute ring buffer
-  for (ki <- 0 until 5) {
-    for (kj <- 0 until 5) {
-      val ii = outRow +& ki.U - pad
-      val jj = outCol +& kj.U - pad
-      val inBounds = ii < 32.U && jj < 32.U
-      
-      // map the absolute image row directly to its physical 6-slot location
-      val rowIdx = ii % 6.U
-      
-      // fixed point gets lower 16 bits
-      conv.io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(rowIdx)(jj)(15, 0), 0.U(16.W))
-      // fp gets full 32 bits
-      convFP.io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(rowIdx)(jj), 0.U(32.W))
+  // combinational window construction
+  for (p <- 0 until PARALLEL) {
+    for (ki <- 0 until 5) {
+      for (kj <- 0 until 5) {
+        val ii = outRow +& ki.U - pad
+        val jj = (outCol + p.U) +& kj.U - pad
+        val inBounds = ii < 32.U && jj < 32.U
+        val rowIdx = ii % 6.U
+        
+        // Integer modules (0 to 3) always get wired
+        convs(p).io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(rowIdx)(jj)(15, 0), 0.U(16.W))
+        
+        // FP modules (0 to 1) only get wired for the first 2
+        if (p < FP_PARALLEL) {
+            convFPs(p).io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(rowIdx)(jj), 0.U(32.W))
+        }
+      }
     }
   }
 
@@ -202,49 +207,42 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
 
     // stream: load input rows, compute, and store output concurrently
     is(sSTREAM) {
-      val result = Mux(isFloatMode, convFP.io.result, conv.io.result >> 8)
+      val intResults = VecInit(convs.map(_.io.result >> 8))
+      val fpResults  = VecInit(convFPs.map(_.io.result))
+
       val respFire = io.mem.resp.valid
-      // tag bit4=1 marks store, bit4=0 marks load - reliable across cache pipeline
       val isLoadResp = !io.mem.resp.bits.tag(4)
 
-      // fetcher throttle - keep 5 rows in the buffer max, leaving 1 safe slot
       val rowsRequested = Mux(isFloatMode, loadRowReqIdx >> 4, loadRowReqIdx >> 3)
       val canFetch = rowsRequested < outRow + (6.U - pad)
-
-      // 64-bit loads: fp=512 requests (2x32-bit), int=256 requests (4x16-bit)
       val totalRequests = Mux(isFloatMode, 512.U, 256.U)
+      val totalStores = Mux(isFloatMode, 511.U, 255.U)
 
-      // bus arbitration - stores take priority to unblock compute
-      val storeReady = Mux(isFloatMode, stageCount === 1.U, stageCount === 3.U)
+      // Store Arbitration
       val wantLoad = canFetch && loadInflight < MAX_INFLIGHT.U && loadRowReqIdx < totalRequests
-      val wantStore = storeReady && storeInflight < MAX_INFLIGHT.U
+      val wantStore = stagingValid && storeInflight < MAX_INFLIGHT.U
 
       when(wantStore) {
-        // issue store request - tag bit4=1, lower 4 bits = store index (16 unique tags)
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)
         io.mem.req.bits.cmd := M_XWR
         io.mem.req.bits.size := 3.U
         io.mem.req.bits.tag := Cat(1.U(1.W), storeReqIdx(3, 0))
-        io.mem.req.bits.data := Mux(isFloatMode, 
-          Cat(result, stagingVal(31, 0)), 
-          Cat(result(15, 0), stagingVal(47, 0)))
+        io.mem.req.bits.data := stagingVal
         when(io.mem.req.ready) { storeReqIdx := storeReqIdx + 1.U }
       } .elsewhen(wantLoad) {
-        // issue 64-bit load - tag bit4=0, lower 4 bits = load index (16 unique tags)
         io.mem.req.valid := true.B
         io.mem.req.bits.cmd := M_XRD
-        io.mem.req.bits.size := 3.U  // 64-bit
+        io.mem.req.bits.size := 3.U
         io.mem.req.bits.tag := Cat(0.U(1.W), loadRowReqIdx(3, 0))
-        io.mem.req.bits.addr := inputAddr + (loadRowReqIdx << 3)  // 8 bytes per request
+        io.mem.req.bits.addr := inputAddr + (loadRowReqIdx << 3)
         when(io.mem.req.ready) { loadRowReqIdx := loadRowReqIdx + 1.U }
       }
 
-      // handle responses - route by tag bit4
+      // handle responses
       when(respFire) {
         when(isLoadResp) {
           when(isFloatMode) {
-            // unpack 2 x 32-bit floats - always within same row
             val base = loadRowRespIdx << 1
             val row = (base >> 5) % 6.U
             val col0 = base & 31.U
@@ -253,7 +251,6 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
             loadRowRespIdx := loadRowRespIdx + 1.U
             when(col0 + 1.U === 31.U) { rowsLoaded := rowsLoaded + 1.U }
           } .otherwise {
-            // unpack 4 x 16-bit fixed point - always within same row
             val base = loadRowRespIdx << 2
             val row = (base >> 5) % 6.U
             val col0 = base & 31.U
@@ -265,14 +262,11 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
             when(col0 + 3.U === 31.U) { rowsLoaded := rowsLoaded + 1.U }
           }
         } .otherwise {
-          // store response
           storeRespIdx := storeRespIdx + 1.U
-          val totalStores = Mux(isFloatMode, 511.U, 255.U)
           when(storeRespIdx === totalStores) { state := sDONE }
         }
       }
 
-      // inflight counters with net change pattern
       val loadReqFire = wantLoad && !wantStore && io.mem.req.ready
       val storeReqFire = wantStore && io.mem.req.ready
       val loadRespFire = respFire && isLoadResp
@@ -284,36 +278,35 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       when(storeReqFire && !storeRespFire) { storeInflight := storeInflight + 1.U }
       .elsewhen(!storeReqFire && storeRespFire) { storeInflight := storeInflight - 1.U }
 
-      // compute - only when enough rows loaded for current window
       val rawNeeded = outRow +& kernelSize - pad
       val rowsNeeded = Mux(rawNeeded > 32.U, 32.U, rawNeeded)
       val enoughRows = rowsLoaded >= rowsNeeded
-      val reqFireStore = wantStore && io.mem.req.ready
-      val canCompute = computeIdx < 1024.U && enoughRows && (!storeReady || reqFireStore)
+      
+      // Compute fires if we have rows AND the buffer isn't full (or is emptying this cycle)
+      val canCompute = computeIdx < 1024.U && enoughRows && (!stagingValid || storeReqFire)
 
       when(canCompute) {
-        computeIdx := computeIdx + 1.U
-        when(outCol === 31.U) {
+        val colStep = Mux(isFloatMode, FP_PARALLEL.U, PARALLEL.U)
+        val colEnd = Mux(isFloatMode, (32 - FP_PARALLEL).U, (32 - PARALLEL).U)
+        
+        computeIdx := computeIdx + colStep
+
+        when(outCol === colEnd) {
           outCol := 0.U
-          when(outRow =/= 31.U) {
-            outRow := outRow + 1.U
-          }
+          when(outRow =/= 31.U) { outRow := outRow + 1.U }
         } .otherwise {
-          outCol := outCol + 1.U
+          outCol := outCol + colStep
         }
-        // pack into shift register
-        when(isFloatMode) {
-          when(stageCount === 0.U) {
-            stagingVal := result
-            stageCount := 1.U
-          } .otherwise {
-            stageCount := 0.U
-          }
-        } .otherwise {
-          // shift oldest 16-bit values to the lowest bytes (little endian)
-          stagingVal := Cat(result(15, 0), stagingVal(47, 16))
-          stageCount := stageCount + 1.U // natively wraps 3 -> 0
-        }
+
+        // Always latch exactly 64 bits and mark valid
+        stagingVal := Mux(isFloatMode, 
+          Cat(fpResults(1), fpResults(0)), 
+          Cat(intResults(3)(15,0), intResults(2)(15,0), intResults(1)(15,0), intResults(0)(15,0))
+        )
+        stagingValid := true.B
+      } .elsewhen(storeReqFire) {
+        // If we fired a store but DID NOT compute new data, the buffer is now empty
+        stagingValid := false.B
       }
     }
 
