@@ -66,9 +66,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   // kernel buffer
   val kernelBuffer = RegInit(VecInit(Seq.fill(25)(0.U(32.W))))
 
-  // output streaming registers - buffer 2 elements then fire 64-bit store
-  val stagingVal = RegInit(0.U(32.W))
-  val stagingFull = RegInit(false.B)
+  // output streaming registers
+  val stagingVal = RegInit(0.U(48.W))
+  val stageCount = RegInit(0.U(2.W))
   val computeIdx = RegInit(0.U(11.W))
 
   // compute counters
@@ -120,7 +120,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     kernelRespIdx := 0.U
     kernelInflight := 0.U
     stagingVal := 0.U
-    stagingFull := false.B
+    stageCount := 0.U
     computeIdx := 0.U
     outRow := 0.U
     outCol := 0.U
@@ -215,8 +215,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       val totalRequests = Mux(isFloatMode, 512.U, 256.U)
 
       // bus arbitration - stores take priority to unblock compute
+      val storeReady = Mux(isFloatMode, stageCount === 1.U, stageCount === 3.U)
       val wantLoad = canFetch && loadInflight < MAX_INFLIGHT.U && loadRowReqIdx < totalRequests
-      val wantStore = stagingFull && storeInflight < MAX_INFLIGHT.U
+      val wantStore = storeReady && storeInflight < MAX_INFLIGHT.U
 
       when(wantStore) {
         // issue store request - tag bit4=1, lower 4 bits = store index (16 unique tags)
@@ -225,7 +226,9 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         io.mem.req.bits.cmd := M_XWR
         io.mem.req.bits.size := 3.U
         io.mem.req.bits.tag := Cat(1.U(1.W), storeReqIdx(3, 0))
-        io.mem.req.bits.data := Cat(result, stagingVal)
+        io.mem.req.bits.data := Mux(isFloatMode, 
+          Cat(result, stagingVal(31, 0)), 
+          Cat(result(15, 0), stagingVal(47, 0)))
         when(io.mem.req.ready) { storeReqIdx := storeReqIdx + 1.U }
       } .elsewhen(wantLoad) {
         // issue 64-bit load - tag bit4=0, lower 4 bits = load index (16 unique tags)
@@ -264,7 +267,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         } .otherwise {
           // store response
           storeRespIdx := storeRespIdx + 1.U
-          when(storeRespIdx === 511.U) { state := sDONE }
+          val totalStores = Mux(isFloatMode, 511.U, 255.U)
+          when(storeRespIdx === totalStores) { state := sDONE }
         }
       }
 
@@ -285,7 +289,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       val rowsNeeded = Mux(rawNeeded > 32.U, 32.U, rawNeeded)
       val enoughRows = rowsLoaded >= rowsNeeded
       val reqFireStore = wantStore && io.mem.req.ready
-      val canCompute = computeIdx < 1024.U && enoughRows && (!stagingFull || reqFireStore)
+      val canCompute = computeIdx < 1024.U && enoughRows && (!storeReady || reqFireStore)
 
       when(canCompute) {
         computeIdx := computeIdx + 1.U
@@ -297,11 +301,18 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         } .otherwise {
           outCol := outCol + 1.U
         }
-        when(!stagingFull) {
-          stagingVal := result
-          stagingFull := true.B
+        // pack into shift register
+        when(isFloatMode) {
+          when(stageCount === 0.U) {
+            stagingVal := result
+            stageCount := 1.U
+          } .otherwise {
+            stageCount := 0.U
+          }
         } .otherwise {
-          stagingFull := false.B
+          // shift oldest 16-bit values to the lowest bytes (little endian)
+          stagingVal := Cat(result(15, 0), stagingVal(47, 16))
+          stageCount := stageCount + 1.U // natively wraps 3 -> 0
         }
       }
     }

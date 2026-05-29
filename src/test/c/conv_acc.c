@@ -4,10 +4,7 @@
 #include <stdint.h>
 
 #define N 32
-#define K 3
-
-typedef uint16_t fixed88;
-typedef uint32_t fixed88_wide;
+#define K 5
 
 static inline void conv_set_input(void *input, void *output)
 {
@@ -27,9 +24,9 @@ static inline unsigned long conv_poll(void)
 }
 
 // page aligned to avoid TLB page boundary faults
-static fixed88 input[N][N] __attribute__((aligned(4096)));
-static fixed88 kernel[K][K] __attribute__((aligned(64)));
-static fixed88_wide output[N][N] __attribute__((aligned(4096)));
+static uint16_t input[N][N] __attribute__((aligned(4096)));
+static uint16_t kernel[K][K] __attribute__((aligned(64)));
+static uint16_t output[N][N] __attribute__((aligned(4096)));
 
 int main() {
     unsigned long start, end;

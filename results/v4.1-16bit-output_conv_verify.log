@@ -1,0 +1,7 @@
+[UART] UART0 is here (stdin/stdout).
+Testing K=3 kernel
+PASS: all 1024 elements match
+Software: 234858 cycles
+Hardware: 1137 cycles
+Speedup: 206x
+- /home/trist/chipyard/sims/verilator/generated-src/chipyard.harness.TestHarness.ConvAcceleratorConfig/gen-collateral/TestDriver.v:158: Verilog $finish

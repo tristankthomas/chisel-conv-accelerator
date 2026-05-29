@@ -6,8 +6,6 @@
 #define N 32
 #define K 3
 
-typedef uint16_t fixed88;
-typedef uint32_t fixed88_wide;
 
 static inline void conv_set_input(void *input, void *output)
 {
@@ -33,10 +31,10 @@ static uint16_t prng_next(void) {
     return (uint16_t)((prng_state >> 16) & 0xFF) + 1;
 }
 
-static fixed88 input[N][N] __attribute__((aligned(4096)));
-static fixed88 kernel_mat[K][K] __attribute__((aligned(64)));
-static fixed88_wide hw_output[N][N] __attribute__((aligned(4096)));
-static fixed88_wide sw_output[N][N];
+static uint16_t input[N][N] __attribute__((aligned(4096)));
+static uint16_t kernel_mat[K][K] __attribute__((aligned(64)));
+static uint16_t hw_output[N][N] __attribute__((aligned(4096)));
+static uint16_t sw_output[N][N];
 
 int main() {
     unsigned long sw_start, sw_end, hw_start, hw_end;
@@ -75,7 +73,7 @@ int main() {
                         acc += (uint32_t)input[ii][jj] * (uint32_t)kernel_mat[ki][kj];
                 }
             }
-            sw_output[i][j] = (fixed88_wide)(acc >> 8);
+            sw_output[i][j] = (uint16_t)(acc >> 8);
         }
     }
     sw_end = rdcycle();
