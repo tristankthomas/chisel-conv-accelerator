@@ -52,8 +52,14 @@ int main() {
     conv_start(kernel, K);
 
     unsigned long status;
+    unsigned long timeout = 10000;
     do {
         status = conv_poll();
+        timeout--;
+        if (timeout == 0) {
+            printf("TIMEOUT: accelerator did not complete\n");
+            return 1;
+        }
     } while (!(status & 0x1));
 
     end = rdcycle();

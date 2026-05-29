@@ -26,6 +26,13 @@ static inline unsigned long conv_poll(void)
     return status;
 }
 
+// simple LCG pseudo-random generator
+static uint32_t prng_state = 12345;
+static uint16_t prng_next(void) {
+    prng_state = prng_state * 1664525 + 1013904223;
+    return (uint16_t)((prng_state >> 16) & 0xFF) + 1;
+}
+
 static fixed88 input[N][N] __attribute__((aligned(4096)));
 static fixed88 kernel_mat[K][K] __attribute__((aligned(64)));
 static fixed88_wide hw_output[N][N] __attribute__((aligned(4096)));
@@ -34,27 +41,27 @@ static fixed88_wide sw_output[N][N];
 int main() {
     unsigned long sw_start, sw_end, hw_start, hw_end;
 
-    // non-uniform input - each element has a distinct value
     for (int i = 0; i < N; i++)
         for (int j = 0; j < N; j++) {
-            input[i][j] = (fixed88)((i * N + j + 1) & 0xFF);  // values 1..255
+            input[i][j] = prng_next();
             hw_output[i][j] = 0;
         }
 
-    // non-uniform kernel - distinct values per element to expose lane bugs
-    // in 8.8 fixed point: value = actual * 256
-    // use small distinct values so products don't overflow
-    kernel_mat[0][0] = 10;   // 0.039
-    kernel_mat[0][1] = 20;   // 0.078
-    kernel_mat[0][2] = 30;   // 0.117
-    kernel_mat[1][0] = 40;   // 0.156
-    kernel_mat[1][1] = 50;   // 0.195
-    kernel_mat[1][2] = 60;   // 0.234
-    kernel_mat[2][0] = 70;   // 0.273
-    kernel_mat[2][1] = 80;   // 0.313
-    kernel_mat[2][2] = 90;   // 0.352
+    for (int i = 0; i < K; i++)
+        for (int j = 0; j < K; j++)
+            kernel_mat[i][j] = (prng_next() & 0x1F) + 1;
 
-    // software convolution
+    printf("Testing K=%d kernel\n", K);
+
+    // hardware convolution runs FIRST while TLB is hot
+    hw_start = rdcycle();
+    conv_set_input(input, hw_output);
+    conv_start(kernel_mat, K);
+    unsigned long status;
+    do { status = conv_poll(); } while (!(status & 0x1));
+    hw_end = rdcycle();
+
+    // software convolution runs SECOND
     sw_start = rdcycle();
     int pad = K / 2;
     for (int i = 0; i < N; i++) {
@@ -73,41 +80,24 @@ int main() {
     }
     sw_end = rdcycle();
 
-    // hardware convolution
-    hw_start = rdcycle();
-    conv_set_input(input, hw_output);
-    conv_start(kernel_mat, K);
-    unsigned long status;
-    do {
-        status = conv_poll();
-    } while (!(status & 0x1));
-    hw_end = rdcycle();
-
     if (status & 0x2) {
         printf("ERROR: accelerator reported error\n");
         return 1;
     }
 
-    // verify all elements
     int errors = 0;
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (hw_output[i][j] != sw_output[i][j]) {
                 printf("MISMATCH [%d][%d]: hw=%u sw=%u\n", i, j, hw_output[i][j], sw_output[i][j]);
-                errors++;
-                if (errors >= 10) {
-                    printf("Too many errors, stopping\n");
-                    goto done;
-                }
+                if (++errors >= 10) { printf("Too many errors, stopping\n"); goto done; }
             }
         }
     }
 
 done:
-    if (errors == 0)
-        printf("PASS: all %d elements match\n", N * N);
-    else
-        printf("FAIL: %d mismatches\n", errors);
+    if (errors == 0) printf("PASS: all %d elements match\n", N * N);
+    else printf("FAIL: %d mismatches\n", errors);
 
     printf("Software: %lu cycles\n", sw_end - sw_start);
     printf("Hardware: %lu cycles\n", hw_end - hw_start);
