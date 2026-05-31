@@ -17,14 +17,14 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     with HasCoreParameters {
 
   val MAX_INFLIGHT = 16
-  val PARALLEL = 4  // output elements computed per cycle
+  val PARALLEL = 4 // output elements computed per cycle
   val FP_PARALLEL = 2 // fp bus-limited to 2x32=64 bits
 
   // funct7 encodings
   val FUNC_SET_INPUT = 0.U
   val FUNC_START_INT = 1.U
-  val FUNC_POLL_STATUS = 2.U
-  val FUNC_START_FP = 3.U
+  val FUNC_START_FP = 2.U
+  val FUNC_POLL_STATUS = 3.U
 
   // FSM states
   val sIDLE :: sLOAD_KERNEL :: sSTREAM :: sDONE :: Nil = Enum(4)
@@ -218,11 +218,18 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       val totalRequests = Mux(isFloatMode, 512.U, 256.U)
       val totalStores = Mux(isFloatMode, 511.U, 255.U)
 
-      // Store Arbitration
+      // load store arbitration
       val wantLoad = canFetch && loadInflight < MAX_INFLIGHT.U && loadRowReqIdx < totalRequests
       val wantStore = stagingValid && storeInflight < MAX_INFLIGHT.U
 
-      when(wantStore) {
+      when(wantLoad) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.cmd := M_XRD
+        io.mem.req.bits.size := 3.U
+        io.mem.req.bits.tag := Cat(0.U(1.W), loadRowReqIdx(3, 0))
+        io.mem.req.bits.addr := inputAddr + (loadRowReqIdx << 3)
+        when(io.mem.req.ready) { loadRowReqIdx := loadRowReqIdx + 1.U }
+      } .elsewhen(wantStore) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)
         io.mem.req.bits.cmd := M_XWR
@@ -230,13 +237,6 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         io.mem.req.bits.tag := Cat(1.U(1.W), storeReqIdx(3, 0))
         io.mem.req.bits.data := stagingVal
         when(io.mem.req.ready) { storeReqIdx := storeReqIdx + 1.U }
-      } .elsewhen(wantLoad) {
-        io.mem.req.valid := true.B
-        io.mem.req.bits.cmd := M_XRD
-        io.mem.req.bits.size := 3.U
-        io.mem.req.bits.tag := Cat(0.U(1.W), loadRowReqIdx(3, 0))
-        io.mem.req.bits.addr := inputAddr + (loadRowReqIdx << 3)
-        when(io.mem.req.ready) { loadRowReqIdx := loadRowReqIdx + 1.U }
       }
 
       // handle responses
@@ -267,8 +267,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         }
       }
 
-      val loadReqFire = wantLoad && !wantStore && io.mem.req.ready
-      val storeReqFire = wantStore && io.mem.req.ready
+      val loadReqFire = wantLoad && io.mem.req.ready
+      val storeReqFire = wantStore && !wantLoad && io.mem.req.ready
       val loadRespFire = respFire && isLoadResp
       val storeRespFire = respFire && !isLoadResp
 
@@ -282,7 +282,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       val rowsNeeded = Mux(rawNeeded > 32.U, 32.U, rawNeeded)
       val enoughRows = rowsLoaded >= rowsNeeded
       
-      // Compute fires if we have rows AND the buffer isn't full (or is emptying this cycle)
+      // compute fires if we have rows AND the buffer isn't full (or is emptying this cycle)
       val canCompute = computeIdx < 1024.U && enoughRows && (!stagingValid || storeReqFire)
 
       when(canCompute) {
@@ -298,14 +298,14 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
           outCol := outCol + colStep
         }
 
-        // Always latch exactly 64 bits and mark valid
+        // always latch exactly 64 bits and mark valid
         stagingVal := Mux(isFloatMode, 
           Cat(fpResults(1), fpResults(0)), 
           Cat(intResults(3)(15,0), intResults(2)(15,0), intResults(1)(15,0), intResults(0)(15,0))
         )
         stagingValid := true.B
       } .elsewhen(storeReqFire) {
-        // If we fired a store but DID NOT compute new data, the buffer is now empty
+        // if we fired a store but DID NOT compute new data, the buffer is now empty
         stagingValid := false.B
       }
     }

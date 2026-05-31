@@ -14,13 +14,13 @@ static inline void conv_set_input(void *input, void *output)
 // funct7=3 for FP mode
 static inline void conv_start_fp(void *kernel, unsigned long kernel_size)
 {
-    ROCC_INSTRUCTION_SS(0, (unsigned long)kernel, kernel_size, 3);
+    ROCC_INSTRUCTION_SS(0, (unsigned long)kernel, kernel_size, 2);
 }
 
 static inline unsigned long conv_poll(void)
 {
     unsigned long status;
-    ROCC_INSTRUCTION_DS(0, status, 0, 2);
+    ROCC_INSTRUCTION_DS(0, status, 0, 3);
     return status;
 }
 

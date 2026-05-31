@@ -19,7 +19,7 @@ static inline void conv_start(void *kernel, unsigned long kernel_size)
 static inline unsigned long conv_poll(void)
 {
     unsigned long status;
-    ROCC_INSTRUCTION_DS(0, status, 0, 2);
+    ROCC_INSTRUCTION_DS(0, status, 0, 3);
     return status;
 }
 

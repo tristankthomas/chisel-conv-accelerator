@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define N 32
-#define K 3
+#define K 5
 
 
 static inline void conv_set_input(void *input, void *output)
@@ -20,12 +20,12 @@ static inline void conv_start(void *kernel, unsigned long kernel_size)
 static inline unsigned long conv_poll(void)
 {
     unsigned long status;
-    ROCC_INSTRUCTION_DS(0, status, 0, 2);
+    ROCC_INSTRUCTION_DS(0, status, 0, 3);
     return status;
 }
 
 // simple LCG pseudo-random generator
-static uint32_t prng_state = 12345;
+static uint32_t prng_state = 12533;
 static uint16_t prng_next(void) {
     prng_state = prng_state * 1664525 + 1013904223;
     return (uint16_t)((prng_state >> 16) & 0xFF) + 1;
