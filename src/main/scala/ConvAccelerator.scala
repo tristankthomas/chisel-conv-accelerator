@@ -61,8 +61,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   // line buffer - 6 rows max to allow N+1 streaming for 5x5 kernels
   val lineBuffer = RegInit(VecInit(Seq.fill(6)(VecInit(Seq.fill(32)(0.U(32.W))))))
   val rowsLoaded = RegInit(0.U(6.W))
-  val loadRowReqIdx = RegInit(0.U(11.W))
-  val loadRowRespIdx = RegInit(0.U(11.W))
+  val loadReqIdx = RegInit(0.U(10.W))
+  val loadRespIdx = RegInit(0.U(10.W))
   val loadInflight = RegInit(0.U(4.W))
 
   // kernel buffer
@@ -78,8 +78,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
   val outCol = RegInit(0.U(5.W))
 
   // store counters
-  val storeReqIdx = RegInit(0.U(11.W))
-  val storeRespIdx = RegInit(0.U(11.W))
+  val storeReqIdx = RegInit(0.U(10.W))
+  val storeRespIdx = RegInit(0.U(10.W))
   val storeInflight = RegInit(0.U(4.W))
 
   // kernel load counters
@@ -112,8 +112,8 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
     done := false.B
     error := false.B
     rowsLoaded := 0.U
-    loadRowReqIdx := 0.U
-    loadRowRespIdx := 0.U
+    loadReqIdx := 0.U
+    loadRespIdx := 0.U
     loadInflight := 0.U
     storeReqIdx := 0.U
     storeRespIdx := 0.U
@@ -213,22 +213,24 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       val respFire = io.mem.resp.valid
       val isLoadResp = !io.mem.resp.bits.tag(4)
 
-      val rowsRequested = Mux(isFloatMode, loadRowReqIdx >> 4, loadRowReqIdx >> 3)
-      val canFetch = rowsRequested < outRow + (6.U - pad)
+      // divide by 8 (int) or 16 (float) to get current row requested
+      val rowsRequested = Mux(isFloatMode, loadReqIdx >> 4, loadReqIdx >> 3)
+      // keep fetcher strictly within 6 row lookahead window relative to compute engine
+      val canFetch = rowsRequested < outRow + (6.U - pad) // note requested not response
       val totalRequests = Mux(isFloatMode, 512.U, 256.U)
       val totalStores = Mux(isFloatMode, 511.U, 255.U)
 
       // load store arbitration
-      val wantLoad = canFetch && loadInflight < MAX_INFLIGHT.U && loadRowReqIdx < totalRequests
+      val wantLoad = canFetch && loadInflight < MAX_INFLIGHT.U && loadReqIdx < totalRequests
       val wantStore = stagingValid && storeInflight < MAX_INFLIGHT.U
 
       when(wantLoad) {
         io.mem.req.valid := true.B
         io.mem.req.bits.cmd := M_XRD
         io.mem.req.bits.size := 3.U
-        io.mem.req.bits.tag := Cat(0.U(1.W), loadRowReqIdx(3, 0))
-        io.mem.req.bits.addr := inputAddr + (loadRowReqIdx << 3)
-        when(io.mem.req.ready) { loadRowReqIdx := loadRowReqIdx + 1.U }
+        io.mem.req.bits.tag := Cat(0.U(1.W), loadReqIdx(3, 0))
+        io.mem.req.bits.addr := inputAddr + (loadReqIdx << 3)
+        when(io.mem.req.ready) { loadReqIdx := loadReqIdx + 1.U }
       } .elsewhen(wantStore) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := outputAddr + (storeReqIdx << 3)
@@ -243,22 +245,22 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       when(respFire) {
         when(isLoadResp) {
           when(isFloatMode) {
-            val base = loadRowRespIdx << 1
+            val base = loadRespIdx << 1
             val row = (base >> 5) % 6.U
             val col0 = base & 31.U
             lineBuffer(row)(col0) := io.mem.resp.bits.data(31, 0)
             lineBuffer(row)(col0 + 1.U) := io.mem.resp.bits.data(63, 32)
-            loadRowRespIdx := loadRowRespIdx + 1.U
+            loadRespIdx := loadRespIdx + 1.U
             when(col0 + 1.U === 31.U) { rowsLoaded := rowsLoaded + 1.U }
           } .otherwise {
-            val base = loadRowRespIdx << 2
+            val base = loadRespIdx << 2
             val row = (base >> 5) % 6.U
             val col0 = base & 31.U
             lineBuffer(row)(col0) := io.mem.resp.bits.data(15, 0)
             lineBuffer(row)(col0 + 1.U) := io.mem.resp.bits.data(31, 16)
             lineBuffer(row)(col0 + 2.U) := io.mem.resp.bits.data(47, 32)
             lineBuffer(row)(col0 + 3.U) := io.mem.resp.bits.data(63, 48)
-            loadRowRespIdx := loadRowRespIdx + 1.U
+            loadRespIdx := loadRespIdx + 1.U
             when(col0 + 3.U === 31.U) { rowsLoaded := rowsLoaded + 1.U }
           }
         } .otherwise {
@@ -278,6 +280,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       when(storeReqFire && !storeRespFire) { storeInflight := storeInflight + 1.U }
       .elsewhen(!storeReqFire && storeRespFire) { storeInflight := storeInflight - 1.U }
 
+      // only compute when enough rows are loaded and stop at 32
       val rawNeeded = outRow +& kernelSize - pad
       val rowsNeeded = Mux(rawNeeded > 32.U, 32.U, rawNeeded)
       val enoughRows = rowsLoaded >= rowsNeeded
