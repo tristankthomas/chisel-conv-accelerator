@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define N 32
-#define K 1
+#define K 7
 
 
 static inline void conv_set_input(void *input, void *output)
@@ -59,6 +59,12 @@ int main() {
     do { status = conv_poll(); } while (!(status & 0x1));
     hw_end = rdcycle();
 
+    if (status & 0x2) {
+        printf("ERROR: accelerator reported error\n");
+        printf("Hardware: %lu cycles\n", hw_end - hw_start);
+        return 0;
+    }
+
     // software convolution runs SECOND
     sw_start = rdcycle();
     int pad = K / 2;
@@ -78,10 +84,7 @@ int main() {
     }
     sw_end = rdcycle();
 
-    if (status & 0x2) {
-        printf("ERROR: accelerator reported error\n");
-        return 1;
-    }
+
 
     int errors = 0;
     for (int i = 0; i < N; i++) {

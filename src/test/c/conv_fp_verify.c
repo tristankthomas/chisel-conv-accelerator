@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define N 32
-#define K 5
+#define K 3
 
 static inline void conv_set_input(void *input, void *output)
 {

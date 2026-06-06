@@ -148,14 +148,14 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
         val ii = outRow +& ki.U - pad
         val jj = (outCol + p.U) +& kj.U - pad
         val inBounds = ii < 32.U && jj < 32.U
-        val rowIdx = ii % 6.U
+        val slotIdx = ii % 6.U
         
-        // Integer modules (0 to 3) always get wired
-        convs(p).io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(rowIdx)(jj)(15, 0), 0.U(16.W))
+        // input window elements placed in top right to match with buffer - all 0's lined up
+        convs(p).io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(slotIdx)(jj)(15, 0), 0.U(16.W))
         
         // FP modules (0 to 1) only get wired for the first 2
         if (p < FP_PARALLEL) {
-            convFPs(p).io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(rowIdx)(jj), 0.U(32.W))
+            convFPs(p).io.window(ki * 5 + kj) := Mux(inBounds, lineBuffer(slotIdx)(jj), 0.U(32.W))
         }
       }
     }
@@ -191,6 +191,7 @@ class ConvAcceleratorModuleImp(outer: ConvAccelerator)(implicit p: Parameters)
       }
       when(reqFire) { kernelReqIdx := kernelReqIdx + 1.U }
       when(respFire) {
+        // kernel placed in top left of buffer to match input window
         kernelBuffer(kLoadRow * 5.U + kLoadCol) := Mux(isFloatMode,
           io.mem.resp.bits.data(31, 0),
           io.mem.resp.bits.data(15, 0))
