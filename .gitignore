@@ -3,3 +3,10 @@
 build/
 target/
 project/
+
+*.class
+*.jar
+*.zip
+results/*.out
+scripts/*.pdf
+scripts/*.png

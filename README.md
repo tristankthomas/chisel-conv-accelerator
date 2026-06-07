@@ -1,6 +1,6 @@
 # chisel-conv-accelerator
 
-Matrix convolution accelerator for CNN, implemented in Chisel and integrated into Chipyard as a RoCC accelerator attached to a Rocket core via the `custom0` opcode.
+Matrix convolution accelerator for CNN inference, implemented in Chisel and integrated into Chipyard as a RoCC accelerator attached to a Rocket core via the `custom0` opcode. Supports 8.8 fixed-point and IEEE 754 single-precision floating-point convolution with kernel sizes 1×1, 3×3, and 5×5.
 
 ## Dependencies
 
@@ -60,6 +60,7 @@ add_dump_target(<test_name>)
 ```bash
 cd ~/chipyard
 sbt "convAccelerator/testOnly convaccelerator.ConvolutionTest"
+sbt "convAccelerator/testOnly convaccelerator.ConvolutionFPTest"
 ```
 
 ### Full simulation (Verilator)
@@ -75,80 +76,143 @@ make CONFIG=ConvAcceleratorConfig run-binary BINARY=~/chipyard/tests/build/<test
 
 ## Custom Instructions
 
-The accelerator uses the `custom0` opcode with three R-format instructions:
+The accelerator uses the `custom0` opcode with four R-format instructions:
 
-| Instruction | funct7 | xd | xs1 | xs2 | rs1 | rs2 | rd |
+| Instruction | funct7 | xd | xs1 | xs2 | rs1     | rs2         | rd     |
 |---|---|---|---|---|---|---|---|
-| SET_INPUT | 0 | 0 | 1 | 1 | &input | &output | - |
-| START | 1 | 0 | 1 | 1 | &kernel | kernel_size | - |
-| POLL_STATUS | 2 | 1 | 0 | 0 | - | - | status |
+| SET_INPUT   | 0      | 0  | 1   | 1   | &input  | &output     | -      |
+| START_INT   | 1      | 0  | 1   | 1   | &kernel | kernel_size | -      |
+| START_FP    | 2      | 0  | 1   | 1   | &kernel | kernel_size | -      |
+| POLL_STATUS | 3      | 1  | 0   | 0   | -       | -           | status |
 
 Status word: `bit 0 = done`, `bit 1 = error`
 
-Supported kernel sizes: 1x1, 3x3, 5x5 (odd sizes only).
+Supported kernel sizes: 1×1, 3×3, 5×5 (odd sizes only). K=7 and above assert the error flag.
 
 ## Architecture
 
 ### Convolution Algorithm
 
-2D convolution with implicit zero padding. For each output element `(i,j)`, a KxK window is extracted from the input matrix centred on `(i,j)` — out-of-bounds accesses return zero. The window is dot-producted with the kernel and the result is right-shifted by 8 to correct for 8.8 fixed-point multiplication.
+2D convolution with implicit zero padding. For each output element `(i,j)`, a K×K window is extracted from the input matrix centred on `(i,j)` — out-of-bounds accesses return zero. Fixed-point results are right-shifted by 8 to correct for 8.8 fixed-point multiplication. Floating-point results use Berkeley HardFloat MulRecFN and AddRecFN modules.
 
 ### Hardware
 
 ```
 ConvAccelerator (LazyRoCC, custom0)
   └── ConvAcceleratorModuleImp
-        ├── Instruction decode (SET_INPUT, START, POLL_STATUS)
-        ├── FSM (IDLE → LOAD_INPUT → LOAD_KERNEL → COMPUTE → STORE → WAIT_LAST_STORE → DONE)
-        ├── io.mem interface (HellaCacheIO, sequential load/store)
-        └── Convolution (25 parallel MACs + adder tree, combinational)
+        ├── Instruction decode (SET_INPUT, START_INT, START_FP, POLL_STATUS)
+        ├── FSM (IDLE → LOAD_KERNEL → STREAM → DONE)
+        ├── Line buffer (6-slot circular ring buffer, 32 elements per row)
+        ├── Row prefetcher (up to 16 in-flight load requests)
+        ├── Bus arbiter (store priority, tag-based load/store response routing)
+        ├── Convolution × PARALLEL      -- fixed-point engines (16-bit input, 40-bit accumulator)
+        └── ConvolutionFP × FP_PARALLEL -- floating-point engines (Berkeley HardFloat)
 ```
 
-**Convolution module:** 25 parallel 16-bit multipliers with a 5-level adder tree. One output element computed per cycle. Result is 40-bit to prevent overflow during accumulation.
+### Key Design Parameters
 
-**Memory interface:** Sequential load/store via `io.mem` (L1 D-cache). One request in flight at a time using a `reqPending` register. Store completion tracked via response counter to guarantee memory consistency before signalling done.
+| Parameter    | Value | Description                       |
+|---|---|---|
+| PARALLEL     | 4     | Fixed-point compute units         |
+| FP_PARALLEL  | 2     | Floating-point compute units      |
+| MAX_INFLIGHT | 16    | Maximum in-flight memory requests |
+| Line buffer  | 6     | Circular buffer slots (rows)      |
+| Input width  | 32    | Fixed matrix dimension            |
 
-**Internal buffers:**
-- `inputBuffer`: 32×32×16-bit register array
-- `kernelBuffer`: 25×16-bit register array (flattened kernel)
-- `outputBuffer`: 32×32×32-bit register array
+### Performance (Verilator, SimDRAM zero-latency backend, K=3)
 
-**Data format:** 8.8 fixed-point. Output is 32-bit (24.8 effective range after >>8 shift).
+| Version        | Key change                            | Cycles  | Speedup vs SW |
+|---|---|---|---|
+| SW baseline    | --                                    | 237,458 | 1×            |
+| v1 naive       | Sequential load/compute/store         | 7,329   | 32×           |
+| v2 pipelined   | 16 in-flight requests                 | 3,171   | 75×           |
+| v2.1 64-bit    | 4 elements per load and store request | 1,622   | 146×          |
+| v3 streaming   | Output streaming                      | 1,380   | 172×          |
+| v4 line buffer | 6-slot ring buffer and row prefetcher | 1,137   | 209×          |
+| v5 spatial x4  | 4 parallel compute units              | 607     | 386×          |
+
+Peak speedup: **820x for K=5 fixed-point** (607 cycles vs 530,622 cycles SW).
+
+### Memory Subsystem
+
+The streaming phase uses a 6-slot circular line buffer. Row `n` always occupies slot `n mod 6`. A row prefetcher issues load requests up to `6 - floor(K/2)` rows ahead of the compute engine. The throttle condition:
+
+```
+rowsRequested < outRow + (6 - floor(K/2))
+```
+
+is applied to requests issued (not responses received) to account for in-flight requests. Loads and stores share the single 64-bit HellaCacheIO port with store priority arbitration. Load and store responses are distinguished via tag bit 4.
+
+### Compute Engine
+
+**Fixed-point:** 8.8 format. Each engine instantiates 25 parallel 16-bit multipliers feeding a 5-level adder tree with a 40-bit accumulator to prevent overflow. One output element per cycle per engine. Results truncated to 16 bits after right-shift by 8.
+
+**Floating-point:** IEEE 754 single-precision via Berkeley HardFloat. Each engine uses 25 MulRecFN multipliers and an AddRecFN adder tree. Results compared within 4 ULP tolerance in test code.
+
+### Resource Utilisation (Xilinx Artix-7 200T, post-synthesis)
+
+| Resource   | Accelerator only | % of device |
+|---|---|---|
+| Slice LUTs | 87,262           | 65%         |
+| Registers  | 7,824            | 3%          |
+| DSP48      | 250              | 34%         |
+| Block RAM  | 0                | 0%          |
+
+DSP breakdown: 100 for fixed-point (4 engines x 25 multipliers x 1 DSP each), 150 for floating-point (2 engines x 25 MulRecFN x 3 DSPs each). Line buffer implemented entirely in flip-flop registers.
 
 ### FSM States
 
-| State | Description |
+| State       | Description                                            |
 |---|---|
-| IDLE | Waiting for START instruction |
-| LOAD_INPUT | Sequential load of 1024 input elements via io.mem |
-| LOAD_KERNEL | Sequential load of K² kernel elements via io.mem |
-| COMPUTE | 1024 cycles, one output element per cycle |
-| STORE | Sequential store of 1024 output elements via io.mem |
-| WAIT_LAST_STORE | Wait for all 1024 store acknowledgements |
-| DONE | Set done flag, return to IDLE |
+| IDLE        | Waiting for START instruction                          |
+| LOAD_KERNEL | Pipelined load of K^2 kernel elements via HellaCacheIO |
+| STREAM      | Concurrent input prefetch, compute, and output store   |
+| DONE        | Set done flag, return to IDLE                          |
 
 ## Structure
 
 ```
 src/main/scala/
-  ConvAccelerator.scala   -- RoCC module, FSM, memory interface
-  Convolution.scala       -- Pure compute module (25 parallel MACs)
-  MAC.scala               -- Prototype MAC module (separate task)
-  Config.scala            -- WithConvAccelerator mixin
+  ConvAccelerator.scala    -- RoCC module, FSM, memory interface, bus arbiter
+  Convolution.scala        -- Fixed-point compute module (PARALLEL instances)
+  ConvolutionFP.scala      -- Floating-point compute module (FP_PARALLEL instances)
+  Configs.scala            -- WithConvAccelerator mixin
+  MAC.scala                -- Prototype MAC module
 
 src/test/scala/
-  ConvolutionTest.scala   -- ChiselTest unit tests for Convolution module
+  ConvolutionTest.scala    -- ChiselTest unit tests for fixed-point Convolution module
+  ConvolutionFPTest.scala  -- ChiselTest unit tests for floating-point ConvolutionFP module
 
 src/test/c/
-  conv_sw.c               -- Software baseline convolution
-  conv_acc.c              -- Accelerator test with RoCC macros
+  conv_verify.c            -- Fixed-point correctness and performance test (LCG random)
+  conv_fp_verify.c         -- Floating-point correctness and performance test
+  conv_acc.c               -- Legacy fixed-point accelerator test
+  conv_fp_acc.c            -- Legacy floating-point accelerator test
+  conv_sw.c                -- Software baseline fixed-point convolution
+  conv_fp_sw.c             -- Software baseline floating-point convolution
+
+results/
+  v1.0-naive_*             -- Naive sequential implementation results
+  v2.0-pipelined-mem_*     -- Pipelined memory results
+  v2.1-64bit-loads_*       -- 64-bit packed request results
+  v3.1-output-streaming_*  -- Output streaming results
+  v4.1-16bit-output_*      -- Line buffer results
+  v5.0-parallel-*          -- Spatial parallelism results (2x and 4x, int and fp)
+
+scripts/
+  make_plots.py            -- Generates all report and presentation figures
 ```
 
 ## Status
 
-- [x] Convolution module (verified with ChiselTest)
+- [x] Fixed-point convolution module (verified with ChiselTest and Verilator)
+- [x] Floating-point convolution via Berkeley HardFloat
 - [x] RoCC interface and instruction decode
-- [x] FSM with memory load/store
-- [ ] C test code and performance benchmarking
-- [ ] Verilator simulation
-- [ ] Performance optimisations (pipelined memory, line buffer)
+- [x] Pipelined memory with 16 in-flight requests
+- [x] 64-bit packed load and store requests
+- [x] Output streaming with staging register
+- [x] 6-slot circular line buffer with row prefetcher
+- [x] 4x spatial parallelism (fixed-point), 2x (floating-point)
+- [x] Bus arbiter with tag-based load/store response routing
+- [x] Error flag for unsupported kernel sizes
+- [x] Post-synthesis resource characterisation (Vivado, Artix-7 200T)
