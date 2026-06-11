@@ -64,6 +64,7 @@ sbt "convAccelerator/testOnly convaccelerator.ConvolutionFPTest"
 
 ### Full simulation (Verilator)
 
+**Option 1: Manual build and execution**
 ```bash
 cd ~/chipyard/tests/build
 cmake ..
@@ -71,6 +72,11 @@ make <test_name>
 
 cd ~/chipyard/sims/verilator
 make CONFIG=ConvAcceleratorConfig run-binary BINARY=~/chipyard/tests/build/<test_name>.riscv
+```
+
+**Option 2: Using the automated script**
+```bash
+./scripts/run_test.sh <test_name>
 ```
 
 ## Custom Instructions
@@ -200,5 +206,6 @@ results/
 
 scripts/
   make_plots.py            -- Generates all report and presentation figures
+  run_test.sh              -- Automatically builds and runs C test
 ```
 
