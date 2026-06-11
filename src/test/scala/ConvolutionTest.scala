@@ -1,3 +1,7 @@
+// ConvolutionTest.scala
+// unit tests for fixed-point convolution accelerator.
+// verifies basic operations using identity and all-ones kernels in 8.8 format.
+
 package convaccelerator
 
 import chisel3._

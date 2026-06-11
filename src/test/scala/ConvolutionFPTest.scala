@@ -1,3 +1,7 @@
+// ConvolutionFPTest.scala
+// unit tests for floating-point convolution accelerator.
+// verifies basic operations using identity, all-ones, and zero kernels.
+
 package convaccelerator
 
 import chisel3._
@@ -6,6 +10,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 
 class ConvolutionFPTest extends AnyFlatSpec with ChiselScalatestTester {
 
+  // helper functions to convert between Scala Float and 32-bit UInt representations
   def floatBits(f: Float): Long = java.lang.Float.floatToIntBits(f).toLong & 0xFFFFFFFFL
   def bitsToFloat(b: Long): Float = java.lang.Float.intBitsToFloat(b.toInt)
 
@@ -52,6 +57,7 @@ class ConvolutionFPTest extends AnyFlatSpec with ChiselScalatestTester {
 
   "ConvolutionFP" should "return zero for zero kernel" in {
     test(new ConvolutionFP()) { dut =>
+      // zero kernel and sequential window values
       for (i <- 0 until 25) {
         dut.io.kernel(i).poke(floatBits(0.0f).U)
         dut.io.window(i).poke(floatBits((i + 1).toFloat).U)
@@ -59,6 +65,7 @@ class ConvolutionFPTest extends AnyFlatSpec with ChiselScalatestTester {
 
       dut.clock.step(1)
 
+      // assert accumulated result is 0.0
       val result = bitsToFloat(dut.io.result.peek().litValue.toLong)
       assert(math.abs(result) < 0.001f, s"Expected 0.0 but got $result")
     }

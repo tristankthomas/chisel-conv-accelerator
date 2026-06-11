@@ -1,3 +1,7 @@
+// ConvolutionFP.scala
+// fully combinational 5x5 floating-point convolution engine.
+// computes one dot product per cycle; instantiated PARALLEL times in ConvAccelerator.
+
 package convaccelerator
 
 import chisel3._
@@ -7,15 +11,15 @@ import scala.language.reflectiveCalls
 
 class ConvolutionFP extends Module {
   val io = IO(new Bundle {
-    val window = Input(Vec(25, UInt(32.W)))   // IEEE 754 floats
-    val kernel = Input(Vec(25, UInt(32.W)))   // IEEE 754 floats
-    val result = Output(UInt(32.W))           // IEEE 754 float
+    val window = Input(Vec(25, UInt(32.W)))   // flattened 5x5 input window
+    val kernel = Input(Vec(25, UInt(32.W)))   // flattened 5x5 kernel weights
+    val result = Output(UInt(32.W))           // 32-bit floating-point accumulated result
   })
 
   val expWidth = 8
   val sigWidth = 24
 
-  // convert inputs to recoded format and multiply
+  // convert inputs to recoded format and multiply; elaborates into 25 discrete multiplier instances
   val products = (0 until 25).map { i =>
     val mul = Module(new MulRecFN(expWidth, sigWidth))
     mul.io.roundingMode := consts.round_near_even
@@ -25,7 +29,7 @@ class ConvolutionFP extends Module {
     mul.io.out
   }
 
-  // adder tree using AddRecFN
+  // recursive function builds a balanced binary adder tree of depth ceil(log2(25)) = 5
   def addTree(vals: Seq[UInt]): UInt = {
     if (vals.length == 1) {
       vals.head
@@ -47,6 +51,6 @@ class ConvolutionFP extends Module {
 
   val sumRec = addTree(products)
 
-  // convert result back to IEEE 754
+  // convert recoded accumulated result back to standard IEEE 754
   io.result := fNFromRecFN(expWidth, sigWidth, sumRec)
 }

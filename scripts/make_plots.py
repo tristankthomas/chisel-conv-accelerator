@@ -106,7 +106,7 @@ x = np.arange(len(parallelism))
 width = 0.5
 
 p1 = ax4.bar(x, compute_cycles, width, color='#1f77b4', label='Compute cycles')
-p2 = ax4.bar(x, memory_overhead, width, bottom=compute_cycles, color='#ff7f0e', label='Memory-bound cycles')
+p2 = ax4.bar(x, memory_overhead, width, bottom=compute_cycles, color='#ff7f0e', label='Memory-bound cycles + overhead')
 ax4.axhline(y=521, color='#d62728', linestyle='--', linewidth=1.5, label='Memory transaction floor (521 cycles)')
 
 for i, (comp, mem) in enumerate(zip(compute_cycles, memory_overhead)):
@@ -188,7 +188,7 @@ x = np.arange(len(parallelism))
 width = 0.5
 
 ax5.bar(x, compute_cycles, width, color='#1f77b4', label='Compute cycles')
-ax5.bar(x, memory_overhead, width, bottom=compute_cycles, color='#ff7f0e', label='Memory-bound cycles')
+ax5.bar(x, memory_overhead, width, bottom=compute_cycles, color='#ff7f0e', label='Memory-bound cycles + overhead')
 ax5.axhline(y=521, color='#d62728', linestyle='--', linewidth=1.5, label='Memory transaction floor (521 cycles)')
 
 for i, (comp, mem) in enumerate(zip(compute_cycles, memory_overhead)):

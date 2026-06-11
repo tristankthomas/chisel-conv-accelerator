@@ -31,8 +31,7 @@ lazy val convAccelerator = (project in file("generators/conv-accelerator"))
 ```scala
 class ConvAcceleratorConfig extends Config(
   new convaccelerator.WithConvAccelerator ++
-  new freechips.rocketchip.subsystem.WithNBigCores(1) ++
-  new chipyard.config.AbstractConfig)
+  new RocketConfig)
 ```
 
 6. Add test executables to `chipyard/tests/CMakeLists.txt`.
@@ -127,7 +126,7 @@ ConvAccelerator (LazyRoCC, custom0)
 | v1 naive       | Sequential load/compute/store         | 7,329   | 32×           |
 | v2 pipelined   | 16 in-flight requests                 | 3,171   | 75×           |
 | v2.1 64-bit    | 4 elements per load and store request | 1,622   | 146×          |
-| v3 streaming   | Output streaming                      | 1,380   | 172×          |
+| v3 streaming   | Output streaming                      | 1,373   | 173×          |
 | v4 line buffer | 6-slot ring buffer and row prefetcher | 1,137   | 209×          |
 | v5 spatial x4  | 4 parallel compute units              | 607     | 386×          |
 
@@ -203,16 +202,3 @@ scripts/
   make_plots.py            -- Generates all report and presentation figures
 ```
 
-## Status
-
-- [x] Fixed-point convolution module (verified with ChiselTest and Verilator)
-- [x] Floating-point convolution via Berkeley HardFloat
-- [x] RoCC interface and instruction decode
-- [x] Pipelined memory with 16 in-flight requests
-- [x] 64-bit packed load and store requests
-- [x] Output streaming with staging register
-- [x] 6-slot circular line buffer with row prefetcher
-- [x] 4x spatial parallelism (fixed-point), 2x (floating-point)
-- [x] Bus arbiter with tag-based load/store response routing
-- [x] Error flag for unsupported kernel sizes
-- [x] Post-synthesis resource characterisation (Vivado, Artix-7 200T)
